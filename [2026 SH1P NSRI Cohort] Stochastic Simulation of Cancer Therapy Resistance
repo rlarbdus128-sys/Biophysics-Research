@@ -1,1 +1,1005 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.6.6","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"none","dataSources":[],"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"# ============================================================\n# Stochastic Simulation of Cancer Therapy Resistance\n# Based on Biophysical Thermodynamics\n# ------------------------------------------------------------\n# One-run, self-contained Kaggle-ready Python code\n# No external input files required\n# Outputs: compact summary tables + high-resolution figures\n# ============================================================\n\nimport os\nimport math\nimport json\nimport warnings\nfrom dataclasses import dataclass, asdict\nfrom typing import Dict, List, Tuple\nimport numpy as np\nimport pandas as pd\nimport matplotlib.pyplot as plt\nimport seaborn as sns\n\nwarnings.filterwarnings(\"ignore\")\n\n# ============================================================\n# 1. Global configuration\n# ============================================================\n\nRANDOM_SEED = 20260701\nrng = np.random.default_rng(RANDOM_SEED)\n\nOUTPUT_DIR = \"/kaggle/working/biophysical_thermodynamic_resistance_outputs\"\nos.makedirs(OUTPUT_DIR, exist_ok=True)\n\n# Required publication-ready style\nplt.rcParams.update({\n    \"font.size\": 14,\n    \"axes.labelsize\": 16,\n    \"axes.titlesize\": 18,\n    \"xtick.labelsize\": 12,\n    \"ytick.labelsize\": 12,\n    \"figure.titlesize\": 20,\n    \"figure.dpi\": 300,\n    \"savefig.dpi\": 300,\n    \"axes.linewidth\": 1.4,\n    \"lines.linewidth\": 2.5,\n    \"lines.markersize\": 7,\n    \"legend.fontsize\": 12,\n    \"legend.title_fontsize\": 13,\n    \"pdf.fonttype\": 42,\n    \"ps.fonttype\": 42,\n})\n\nsns.set_theme(style=\"whitegrid\", context=\"talk\")\n\n# ============================================================\n# 2. Model definitions\n# ============================================================\n\n@dataclass(frozen=True)\nclass SimulationConfig:\n    n_steps: int = 260\n    dt: float = 1.0\n    n_replicates: int = 160\n\n    initial_sensitive: int = 250000\n    initial_resistant_total: int = 0\n\n    carrying_capacity: int = 2000000\n\n    base_sensitive_growth: float = 0.030\n    base_resistant_growth: float = 0.026\n    base_death: float = 0.010\n\n    baseline_mutation_rate: float = 1.2e-5\n    mutagenic_multiplier: float = 8.0\n\n    normal_to_mutagenic_base: float = 0.002\n    mutagenic_to_normal_base: float = 0.070\n\n    drug_kill_sensitive: float = 0.060\n    drug_kill_mutagenic: float = 0.035\n    drug_kill_resistant: float = 0.010\n\n    t_eff_baseline: float = 1.0\n    t_eff_dose_coeff: float = 1.05\n    t_eff_replication_coeff: float = 0.85\n    t_eff_oxidative_coeff: float = 0.70\n    t_eff_noise_floor: float = 0.05\n\n    entropy_epsilon: float = 1e-12\n\n    specific_variant_name: str = \"APOBEC_like_specific_resistance\"\n    fixation_fraction_threshold: float = 0.60\n\n@dataclass(frozen=True)\nclass DoseScenario:\n    scenario_name: str\n    dose: float\n    schedule_type: str\n\nCONFIG = SimulationConfig()\n\n# Dose scenarios: low, medium, high continuous therapy\nDOSE_SCENARIOS = [\n    DoseScenario(\"low_continuous_dose\", 0.25, \"continuous\"),\n    DoseScenario(\"medium_continuous_dose\", 0.55, \"continuous\"),\n    DoseScenario(\"high_continuous_dose\", 0.90, \"continuous\"),\n    DoseScenario(\"pulsed_high_dose\", 0.90, \"pulsed\"),\n]\n\n# Mutation channels\n# A = neutral/random-like\n# B = APOBEC-like specific resistant variant\n# C = DSB/SV-like resistant variant\n# D = other resistant route\nMUTATION_CHANNELS = [\n    \"neutral_random_like\",\n    \"APOBEC_like_specific_resistance\",\n    \"DSB_SV_like_resistance\",\n    \"other_resistance_route\",\n]\n\nCHANNEL_BASE_FREE_ENERGY = {\n    \"neutral_random_like\": 0.00,\n    \"APOBEC_like_specific_resistance\": 1.15,\n    \"DSB_SV_like_resistance\": 1.45,\n    \"other_resistance_route\": 1.25,\n}\n\nCHANNEL_STRESS_COUPLING = {\n    \"neutral_random_like\": 0.10,\n    \"APOBEC_like_specific_resistance\": 1.35,\n    \"DSB_SV_like_resistance\": 0.95,\n    \"other_resistance_route\": 0.55,\n}\n\nCHANNEL_RESISTANCE_GROWTH_MODIFIER = {\n    \"neutral_random_like\": 0.000,\n    \"APOBEC_like_specific_resistance\": 0.008,\n    \"DSB_SV_like_resistance\": 0.005,\n    \"other_resistance_route\": 0.004,\n}","metadata":{"_uuid":"8f2839f25d086af736a60e9eeb907d3b93b6e0e5","_cell_guid":"b1076dfc-b9ad-4769-8c92-a6c4dae69d19","trusted":true},"outputs":[],"execution_count":null},{"cell_type":"code","source":"# ============================================================\n# 3. Self-contained input generator\n# ============================================================\n\ndef generate_self_contained_inputs(config: SimulationConfig) -> Dict:\n    \"\"\"\n    Generates all synthetic initial conditions and scenarios internally.\n    No external files are required.\n    \"\"\"\n    initial_population = {\n        \"sensitive_normal_fidelity\": config.initial_sensitive,\n        \"sensitive_mutagenic_repair\": 0,\n        \"neutral_random_like\": 0,\n        \"APOBEC_like_specific_resistance\": 0,\n        \"DSB_SV_like_resistance\": 0,\n        \"other_resistance_route\": 0,\n    }\n\n    scenarios = [asdict(s) for s in DOSE_SCENARIOS]\n\n    model_metadata = {\n        \"study_title\": \"Stochastic Simulation of Cancer Therapy Resistance Based on Biophysical Thermodynamics\",\n        \"core_mechanism\": (\n            \"Dose increases replication and oxidative stress; stress raises effective evolutionary temperature; \"\n            \"temperature and stress reshape the free-energy landscape of mutation channels; \"\n            \"reshaped channel probabilities bias resistant variant emergence.\"\n        ),\n        \"random_seed\": RANDOM_SEED,\n        \"config\": asdict(config),\n        \"mutation_channels\": MUTATION_CHANNELS,\n        \"channel_base_free_energy\": CHANNEL_BASE_FREE_ENERGY,\n        \"channel_stress_coupling\": CHANNEL_STRESS_COUPLING,\n    }\n\n    return {\n        \"initial_population\": initial_population,\n        \"scenarios\": scenarios,\n        \"metadata\": model_metadata,\n    }\n\n# ============================================================\n# 4. Biophysical thermodynamic functions\n# ============================================================\n\ndef schedule_dose(scenario: DoseScenario, step: int) -> float:\n    \"\"\"\n    Continuous and pulsed dose schedules.\n    Pulsed high dose: 14 days on, 14 days off.\n    \"\"\"\n    if scenario.schedule_type == \"continuous\":\n        return scenario.dose\n    if scenario.schedule_type == \"pulsed\":\n        cycle = 28\n        return scenario.dose if (step % cycle) < 14 else 0.0\n    raise ValueError(f\"Unknown schedule type: {scenario.schedule_type}\")\n\ndef compute_stress_variables(dose: float, total_cells: int, config: SimulationConfig) -> Tuple[float, float]:\n    \"\"\"\n    Replication stress and oxidative stress are synthetic mechanistic variables.\n    They increase with dose and crowding pressure.\n    \"\"\"\n    crowding_pressure = min(total_cells / max(config.carrying_capacity, 1), 1.5)\n    replication_stress = np.clip(0.15 + 0.85 * dose + 0.25 * crowding_pressure, 0.0, 2.0)\n    oxidative_stress = np.clip(0.10 + 0.75 * dose + 0.15 * crowding_pressure, 0.0, 2.0)\n    return replication_stress, oxidative_stress\n\ndef compute_effective_evolutionary_temperature(\n    dose: float,\n    replication_stress: float,\n    oxidative_stress: float,\n    config: SimulationConfig\n) -> float:\n    \"\"\"\n    Effective evolutionary temperature proxy.\n    Higher dose and stress increase stochasticity of evolutionary search.\n    \"\"\"\n    t_eff = (\n        config.t_eff_baseline\n        + config.t_eff_dose_coeff * dose\n        + config.t_eff_replication_coeff * replication_stress\n        + config.t_eff_oxidative_coeff * oxidative_stress\n        + config.t_eff_noise_floor\n    )\n    return max(t_eff, 0.05)\n\ndef free_energy_landscape(\n    dose: float,\n    replication_stress: float,\n    oxidative_stress: float\n) -> Dict[str, float]:\n    \"\"\"\n    Dose/stress-dependent free-energy landscape deformation.\n    Lower effective free energy gives higher channel probability.\n    APOBEC-like channel is deliberately stress-coupled to represent\n    specific variant channeling beyond random noise.\n    \"\"\"\n    composite_stress = 0.65 * replication_stress + 0.35 * oxidative_stress\n\n    energies = {}\n    for channel in MUTATION_CHANNELS:\n        base_energy = CHANNEL_BASE_FREE_ENERGY[channel]\n        stress_coupling = CHANNEL_STRESS_COUPLING[channel]\n        nonlinear_channeling = 0.0\n\n        if channel == \"APOBEC_like_specific_resistance\":\n            nonlinear_channeling = 0.75 * (dose ** 2) + 0.45 * max(replication_stress - 0.8, 0.0) ** 2\n        elif channel == \"DSB_SV_like_resistance\":\n            nonlinear_channeling = 0.35 * (oxidative_stress ** 2)\n\n        energies[channel] = base_energy - stress_coupling * composite_stress - nonlinear_channeling\n\n    return energies\n\ndef softmax_channel_probabilities(\n    energies: Dict[str, float],\n    t_eff: float,\n    config: SimulationConfig\n) -> Dict[str, float]:\n    \"\"\"\n    Boltzmann-like mapping:\n    p(path_i) ∝ exp(-F_i / T_eff)\n    T_eff controls stochastic exploration; free-energy deformation controls channeling.\n    \"\"\"\n    energy_array = np.array([energies[ch] for ch in MUTATION_CHANNELS], dtype=float)\n    logits = -energy_array / max(t_eff, config.entropy_epsilon)\n    logits = logits - logits.max()\n    weights = np.exp(logits)\n    probs = weights / weights.sum()\n    return {ch: float(p) for ch, p in zip(MUTATION_CHANNELS, probs)}\n\ndef shannon_entropy(probabilities: Dict[str, float], config: SimulationConfig) -> float:\n    \"\"\"\n    Shannon path entropy over mutation channels.\n    H = -sum p_i log(p_i)\n    \"\"\"\n    p = np.array(list(probabilities.values()), dtype=float)\n    p = np.clip(p, config.entropy_epsilon, 1.0)\n    return float(-np.sum(p * np.log(p)))\n\ndef normalized_entropy(probabilities: Dict[str, float], config: SimulationConfig) -> float:\n    return shannon_entropy(probabilities, config) / np.log(len(probabilities))\n\ndef channeling_index(probabilities: Dict[str, float], specific_channel: str) -> float:\n    \"\"\"\n    Channeling Index:\n    specific channel probability / uniform expectation.\n    If >1, the specific resistant pathway is enriched beyond random uniform channel use.\n    \"\"\"\n    uniform_prob = 1.0 / len(probabilities)\n    return probabilities[specific_channel] / uniform_prob","metadata":{"trusted":true},"outputs":[],"execution_count":null},{"cell_type":"code","source":"# ============================================================\n# 5. Memory-efficient stochastic simulation\n# ============================================================\n\ndef simulate_one_replicate(\n    scenario: DoseScenario,\n    config: SimulationConfig,\n    replicate_seed: int\n) -> Tuple[pd.DataFrame, Dict]:\n    \"\"\"\n    Aggregated stochastic simulation.\n    No individual-cell data are stored.\n    Only compact time-step summaries are retained.\n    \"\"\"\n    local_rng = np.random.default_rng(replicate_seed)\n\n    sensitive_normal = int(config.initial_sensitive)\n    sensitive_mutagenic = 0\n\n    resistant_counts = {ch: 0 for ch in MUTATION_CHANNELS}\n\n    timeline_records = []\n\n    cumulative_specific_variants = 0\n    cumulative_all_variants = 0\n    cumulative_path_entropy = 0.0\n    cumulative_t_eff = 0.0\n\n    time_to_first_specific = np.nan\n    time_to_resistant_fixation = np.nan\n\n    for step in range(config.n_steps):\n        dose = schedule_dose(scenario, step)\n\n        total_resistant = int(sum(resistant_counts.values()))\n        total_sensitive = int(sensitive_normal + sensitive_mutagenic)\n        total_cells = int(total_sensitive + total_resistant)\n\n        if total_cells <= 0:\n            replication_stress = 0.0\n            oxidative_stress = 0.0\n            t_eff = config.t_eff_baseline\n            energies = free_energy_landscape(dose, replication_stress, oxidative_stress)\n            channel_probs = softmax_channel_probabilities(energies, t_eff, config)\n            path_h = shannon_entropy(channel_probs, config)\n            path_h_norm = normalized_entropy(channel_probs, config)\n            channel_idx = channeling_index(channel_probs, config.specific_variant_name)\n\n            timeline_records.append({\n                \"step\": step,\n                \"time\": step * config.dt,\n                \"scenario\": scenario.scenario_name,\n                \"dose\": dose,\n                \"total_cells\": 0,\n                \"sensitive_normal\": 0,\n                \"sensitive_mutagenic\": 0,\n                \"total_sensitive\": 0,\n                \"total_resistant\": 0,\n                \"specific_resistant_count\": 0,\n                \"specific_resistant_fraction\": 0.0,\n                \"replication_stress\": replication_stress,\n                \"oxidative_stress\": oxidative_stress,\n                \"T_eff\": t_eff,\n                \"path_entropy\": path_h,\n                \"normalized_path_entropy\": path_h_norm,\n                \"channeling_index\": channel_idx,\n                \"specific_channel_probability\": channel_probs[config.specific_variant_name],\n                \"cumulative_specific_variants\": cumulative_specific_variants,\n                \"cumulative_all_variants\": cumulative_all_variants,\n            })\n            continue\n\n        replication_stress, oxidative_stress = compute_stress_variables(dose, total_cells, config)\n        t_eff = compute_effective_evolutionary_temperature(dose, replication_stress, oxidative_stress, config)\n        energies = free_energy_landscape(dose, replication_stress, oxidative_stress)\n        channel_probs = softmax_channel_probabilities(energies, t_eff, config)\n\n        path_h = shannon_entropy(channel_probs, config)\n        path_h_norm = normalized_entropy(channel_probs, config)\n        channel_idx = channeling_index(channel_probs, config.specific_variant_name)\n\n        crowding_factor = max(0.0, 1.0 - total_cells / config.carrying_capacity)\n\n        # State transition: normal fidelity -> mutagenic repair\n        p_to_mutagenic = np.clip(\n            config.normal_to_mutagenic_base\n            * (1.0 + 1.35 * dose + 0.85 * replication_stress + 0.55 * oxidative_stress),\n            0.0,\n            0.30\n        )\n\n        # Recovery: mutagenic repair -> normal fidelity\n        p_to_normal = np.clip(\n            config.mutagenic_to_normal_base / (1.0 + 0.75 * dose + 0.45 * replication_stress),\n            0.0,\n            0.25\n        )\n\n        new_mutagenic = local_rng.binomial(sensitive_normal, p_to_mutagenic) if sensitive_normal > 0 else 0\n        recovered_normal = local_rng.binomial(sensitive_mutagenic, p_to_normal) if sensitive_mutagenic > 0 else 0\n\n        sensitive_normal = sensitive_normal - new_mutagenic + recovered_normal\n        sensitive_mutagenic = sensitive_mutagenic + new_mutagenic - recovered_normal\n\n        # Growth and death: aggregated binomial/Poisson updates\n        p_birth_sensitive_normal = np.clip(config.base_sensitive_growth * crowding_factor, 0.0, 0.50)\n        p_birth_sensitive_mutagenic = np.clip(config.base_sensitive_growth * 0.82 * crowding_factor, 0.0, 0.50)\n\n        births_normal = local_rng.binomial(sensitive_normal, p_birth_sensitive_normal) if sensitive_normal > 0 else 0\n        births_mutagenic = local_rng.binomial(sensitive_mutagenic, p_birth_sensitive_mutagenic) if sensitive_mutagenic > 0 else 0\n\n        p_death_normal = np.clip(config.base_death + config.drug_kill_sensitive * dose, 0.0, 0.90)\n        p_death_mutagenic = np.clip(config.base_death + config.drug_kill_mutagenic * dose + 0.004 * oxidative_stress, 0.0, 0.90)\n\n        deaths_normal = local_rng.binomial(sensitive_normal, p_death_normal) if sensitive_normal > 0 else 0\n        deaths_mutagenic = local_rng.binomial(sensitive_mutagenic, p_death_mutagenic) if sensitive_mutagenic > 0 else 0\n\n        sensitive_normal = max(0, sensitive_normal + births_normal - deaths_normal)\n        sensitive_mutagenic = max(0, sensitive_mutagenic + births_mutagenic - deaths_mutagenic)\n\n        # Stress-dependent mutation rate\n        effective_mutation_rate_normal = config.baseline_mutation_rate * (1.0 + 0.30 * (t_eff - config.t_eff_baseline))\n        effective_mutation_rate_mutagenic = (\n            config.baseline_mutation_rate\n            * config.mutagenic_multiplier\n            * (1.0 + 0.65 * (t_eff - config.t_eff_baseline))\n        )\n\n        effective_mutation_rate_normal = np.clip(effective_mutation_rate_normal, 0.0, 0.05)\n        effective_mutation_rate_mutagenic = np.clip(effective_mutation_rate_mutagenic, 0.0, 0.15)\n\n        mutation_trials_normal = max(0, births_normal)\n        mutation_trials_mutagenic = max(0, births_mutagenic)\n\n        n_mutations_normal = local_rng.binomial(mutation_trials_normal, effective_mutation_rate_normal) if mutation_trials_normal > 0 else 0\n        n_mutations_mutagenic = local_rng.binomial(mutation_trials_mutagenic, effective_mutation_rate_mutagenic) if mutation_trials_mutagenic > 0 else 0\n        n_new_mutations = int(n_mutations_normal + n_mutations_mutagenic)\n\n        if n_new_mutations > 0:\n            probs_array = np.array([channel_probs[ch] for ch in MUTATION_CHANNELS])\n            new_channel_counts = local_rng.multinomial(n_new_mutations, probs_array)\n\n            for channel, count in zip(MUTATION_CHANNELS, new_channel_counts):\n                resistant_counts[channel] += int(count)\n\n            specific_new = int(new_channel_counts[MUTATION_CHANNELS.index(config.specific_variant_name)])\n            cumulative_specific_variants += specific_new\n            cumulative_all_variants += n_new_mutations\n\n            if specific_new > 0 and np.isnan(time_to_first_specific):\n                time_to_first_specific = step * config.dt\n\n            # Mutated cells are removed from sensitive compartments in aggregate\n            remove_from_mutagenic = min(sensitive_mutagenic, n_mutations_mutagenic)\n            sensitive_mutagenic -= remove_from_mutagenic\n            remove_from_normal = min(sensitive_normal, n_new_mutations - remove_from_mutagenic)\n            sensitive_normal -= remove_from_normal\n\n        # Resistant clone growth/death by channel\n        for channel in MUTATION_CHANNELS:\n            count = resistant_counts[channel]\n            if count <= 0:\n                continue\n\n            channel_growth = (\n                config.base_resistant_growth\n                + CHANNEL_RESISTANCE_GROWTH_MODIFIER[channel]\n            ) * crowding_factor\n\n            p_birth_resistant = np.clip(channel_growth, 0.0, 0.50)\n            p_death_resistant = np.clip(config.base_death + config.drug_kill_resistant * dose, 0.0, 0.80)\n\n            births_resistant = local_rng.binomial(count, p_birth_resistant)\n            deaths_resistant = local_rng.binomial(count, p_death_resistant)\n            resistant_counts[channel] = max(0, count + births_resistant - deaths_resistant)\n\n        total_resistant = int(sum(resistant_counts.values()))\n        total_sensitive = int(sensitive_normal + sensitive_mutagenic)\n        total_cells = int(total_sensitive + total_resistant)\n\n        specific_count = int(resistant_counts[config.specific_variant_name])\n        specific_resistant_fraction = specific_count / max(total_resistant, 1)\n\n        if (\n            np.isnan(time_to_resistant_fixation)\n            and total_resistant > 0\n            and specific_resistant_fraction >= config.fixation_fraction_threshold\n            and specific_count >= 50\n        ):\n            time_to_resistant_fixation = step * config.dt\n\n        cumulative_path_entropy += path_h\n        cumulative_t_eff += t_eff\n\n        timeline_records.append({\n            \"step\": step,\n            \"time\": step * config.dt,\n            \"scenario\": scenario.scenario_name,\n            \"dose\": dose,\n            \"total_cells\": total_cells,\n            \"sensitive_normal\": sensitive_normal,\n            \"sensitive_mutagenic\": sensitive_mutagenic,\n            \"total_sensitive\": total_sensitive,\n            \"total_resistant\": total_resistant,\n            \"specific_resistant_count\": specific_count,\n            \"specific_resistant_fraction\": specific_resistant_fraction,\n            \"replication_stress\": replication_stress,\n            \"oxidative_stress\": oxidative_stress,\n            \"T_eff\": t_eff,\n            \"path_entropy\": path_h,\n            \"normalized_path_entropy\": path_h_norm,\n            \"channeling_index\": channel_idx,\n            \"specific_channel_probability\": channel_probs[config.specific_variant_name],\n            \"cumulative_specific_variants\": cumulative_specific_variants,\n            \"cumulative_all_variants\": cumulative_all_variants,\n        })\n\n    timeline_df = pd.DataFrame(timeline_records)\n\n    final_row = timeline_df.iloc[-1].to_dict()\n    summary = {\n        \"scenario\": scenario.scenario_name,\n        \"nominal_dose\": scenario.dose,\n        \"schedule_type\": scenario.schedule_type,\n        \"final_surviving_cells\": int(final_row[\"total_cells\"]),\n        \"final_sensitive_cells\": int(final_row[\"total_sensitive\"]),\n        \"final_resistant_cells\": int(final_row[\"total_resistant\"]),\n        \"final_specific_resistant_count\": int(final_row[\"specific_resistant_count\"]),\n        \"final_specific_resistant_fraction_among_resistant\": float(final_row[\"specific_resistant_fraction\"]),\n        \"final_T_eff\": float(final_row[\"T_eff\"]),\n        \"mean_T_eff\": float(timeline_df[\"T_eff\"].mean()),\n        \"final_path_entropy\": float(final_row[\"path_entropy\"]),\n        \"mean_path_entropy\": float(timeline_df[\"path_entropy\"].mean()),\n        \"mean_normalized_path_entropy\": float(timeline_df[\"normalized_path_entropy\"].mean()),\n        \"final_channeling_index\": float(final_row[\"channeling_index\"]),\n        \"mean_channeling_index\": float(timeline_df[\"channeling_index\"].mean()),\n        \"final_specific_channel_probability\": float(final_row[\"specific_channel_probability\"]),\n        \"cumulative_specific_variants\": int(final_row[\"cumulative_specific_variants\"]),\n        \"cumulative_all_variants\": int(final_row[\"cumulative_all_variants\"]),\n        \"observed_specific_variant_share\": (\n            float(final_row[\"cumulative_specific_variants\"] / max(final_row[\"cumulative_all_variants\"], 1))\n        ),\n        \"time_to_first_specific_variant\": time_to_first_specific,\n        \"time_to_specific_resistant_fixation\": time_to_resistant_fixation,\n    }\n\n    return timeline_df, summary\n\ndef run_full_experiment(config: SimulationConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:\n    \"\"\"\n    Runs all dose scenarios and replicates.\n    Stores compact time-average summaries and representative averaged timelines.\n    \"\"\"\n    all_summaries = []\n    timeline_accumulators = []\n\n    run_counter = 0\n\n    for scenario in DOSE_SCENARIOS:\n        scenario_timelines = []\n\n        for rep in range(config.n_replicates):\n            run_counter += 1\n            seed = RANDOM_SEED + run_counter * 101\n            timeline_df, summary = simulate_one_replicate(scenario, config, seed)\n\n            summary[\"replicate\"] = rep\n            summary[\"seed\"] = seed\n            all_summaries.append(summary)\n\n            # Store aggregated timeline only; no cell-level raw data.\n            reduced_timeline = timeline_df[\n                [\n                    \"time\",\n                    \"scenario\",\n                    \"dose\",\n                    \"total_cells\",\n                    \"total_sensitive\",\n                    \"total_resistant\",\n                    \"specific_resistant_count\",\n                    \"specific_resistant_fraction\",\n                    \"replication_stress\",\n                    \"oxidative_stress\",\n                    \"T_eff\",\n                    \"path_entropy\",\n                    \"normalized_path_entropy\",\n                    \"channeling_index\",\n                    \"specific_channel_probability\",\n                    \"cumulative_specific_variants\",\n                    \"cumulative_all_variants\",\n                ]\n            ].copy()\n            reduced_timeline[\"replicate\"] = rep\n            scenario_timelines.append(reduced_timeline)\n\n        scenario_timeline_df = pd.concat(scenario_timelines, ignore_index=True)\n\n        aggregated_timeline = (\n            scenario_timeline_df\n            .groupby([\"scenario\", \"time\"], as_index=False)\n            .agg(\n                mean_dose=(\"dose\", \"mean\"),\n                median_total_cells=(\"total_cells\", \"median\"),\n                mean_total_cells=(\"total_cells\", \"mean\"),\n                median_total_resistant=(\"total_resistant\", \"median\"),\n                mean_total_resistant=(\"total_resistant\", \"mean\"),\n                median_specific_resistant_count=(\"specific_resistant_count\", \"median\"),\n                mean_specific_resistant_count=(\"specific_resistant_count\", \"mean\"),\n                mean_specific_resistant_fraction=(\"specific_resistant_fraction\", \"mean\"),\n                mean_replication_stress=(\"replication_stress\", \"mean\"),\n                mean_oxidative_stress=(\"oxidative_stress\", \"mean\"),\n                mean_T_eff=(\"T_eff\", \"mean\"),\n                mean_path_entropy=(\"path_entropy\", \"mean\"),\n                mean_normalized_path_entropy=(\"normalized_path_entropy\", \"mean\"),\n                mean_channeling_index=(\"channeling_index\", \"mean\"),\n                mean_specific_channel_probability=(\"specific_channel_probability\", \"mean\"),\n                mean_cumulative_specific_variants=(\"cumulative_specific_variants\", \"mean\"),\n                mean_cumulative_all_variants=(\"cumulative_all_variants\", \"mean\"),\n            )\n        )\n\n        timeline_accumulators.append(aggregated_timeline)\n\n    run_level_summary = pd.DataFrame(all_summaries)\n    timeline_summary = pd.concat(timeline_accumulators, ignore_index=True)\n\n    return run_level_summary, timeline_summary","metadata":{"trusted":true},"outputs":[],"execution_count":null},{"cell_type":"code","source":"# ============================================================\n# 6. Run simulation\n# ============================================================\n\ninputs = generate_self_contained_inputs(CONFIG)\nwith open(os.path.join(OUTPUT_DIR, \"self_contained_model_inputs.json\"), \"w\", encoding=\"utf-8\") as f:\n    json.dump(inputs, f, indent=2)\n\nrun_level_summary, timeline_summary = run_full_experiment(CONFIG)\n\n# Scenario-level summary\nscenario_summary = (\n    run_level_summary\n    .groupby([\"scenario\", \"nominal_dose\", \"schedule_type\"], as_index=False)\n    .agg(\n        n_replicates=(\"replicate\", \"count\"),\n        median_final_surviving_cells=(\"final_surviving_cells\", \"median\"),\n        mean_final_surviving_cells=(\"final_surviving_cells\", \"mean\"),\n        median_final_resistant_cells=(\"final_resistant_cells\", \"median\"),\n        mean_final_resistant_cells=(\"final_resistant_cells\", \"mean\"),\n        median_final_specific_resistant_count=(\"final_specific_resistant_count\", \"median\"),\n        mean_final_specific_resistant_count=(\"final_specific_resistant_count\", \"mean\"),\n        mean_T_eff=(\"mean_T_eff\", \"mean\"),\n        mean_path_entropy=(\"mean_path_entropy\", \"mean\"),\n        mean_normalized_path_entropy=(\"mean_normalized_path_entropy\", \"mean\"),\n        mean_channeling_index=(\"mean_channeling_index\", \"mean\"),\n        final_channeling_index_median=(\"final_channeling_index\", \"median\"),\n        mean_specific_channel_probability=(\"final_specific_channel_probability\", \"mean\"),\n        mean_observed_specific_variant_share=(\"observed_specific_variant_share\", \"mean\"),\n        median_cumulative_specific_variants=(\"cumulative_specific_variants\", \"median\"),\n        median_cumulative_all_variants=(\"cumulative_all_variants\", \"median\"),\n        probability_specific_variant_emerged=(\"time_to_first_specific_variant\", lambda x: float(np.mean(~pd.isna(x)))),\n        median_time_to_first_specific_variant=(\"time_to_first_specific_variant\", lambda x: float(pd.Series(x).dropna().median()) if pd.Series(x).dropna().shape[0] > 0 else np.nan),\n        probability_specific_fixation=(\"time_to_specific_resistant_fixation\", lambda x: float(np.mean(~pd.isna(x)))),\n        median_time_to_specific_fixation=(\"time_to_specific_resistant_fixation\", lambda x: float(pd.Series(x).dropna().median()) if pd.Series(x).dropna().shape[0] > 0 else np.nan),\n    )\n)\n\n# Hypothesis-specific compact table\nhypothesis_metrics = scenario_summary[\n    [\n        \"scenario\",\n        \"nominal_dose\",\n        \"schedule_type\",\n        \"median_final_surviving_cells\",\n        \"mean_T_eff\",\n        \"mean_path_entropy\",\n        \"mean_normalized_path_entropy\",\n        \"mean_channeling_index\",\n        \"mean_specific_channel_probability\",\n        \"mean_observed_specific_variant_share\",\n        \"probability_specific_variant_emerged\",\n        \"probability_specific_fixation\",\n        \"median_time_to_first_specific_variant\",\n        \"median_time_to_specific_fixation\",\n    ]\n].copy()\n\n# Save compact outputs only\nrun_level_summary_path = os.path.join(OUTPUT_DIR, \"run_level_summary_compact.csv\")\nscenario_summary_path = os.path.join(OUTPUT_DIR, \"scenario_summary_metrics.csv\")\ntimeline_summary_path = os.path.join(OUTPUT_DIR, \"timeline_path_entropy_Teff_channeling.csv\")\nhypothesis_metrics_path = os.path.join(OUTPUT_DIR, \"hypothesis_verification_metrics.csv\")\n\nrun_level_summary.to_csv(run_level_summary_path, index=False)\nscenario_summary.to_csv(scenario_summary_path, index=False)\ntimeline_summary.to_csv(timeline_summary_path, index=False)\nhypothesis_metrics.to_csv(hypothesis_metrics_path, index=False)\n\n# ============================================================\n# 7. Publication-ready visualization\n# ============================================================\n\ndef save_current_figure(filename_base: str):\n    png_path = os.path.join(OUTPUT_DIR, f\"{filename_base}.png\")\n    pdf_path = os.path.join(OUTPUT_DIR, f\"{filename_base}.pdf\")\n    plt.tight_layout()\n    plt.savefig(png_path, dpi=300, bbox_inches=\"tight\", facecolor=\"white\")\n    plt.savefig(pdf_path, dpi=300, bbox_inches=\"tight\", facecolor=\"white\")\n    plt.show()\n    return png_path, pdf_path\n\nsaved_figures = []\n\n# Figure 1: T_eff over time\nplt.figure(figsize=(11, 7))\nsns.lineplot(\n    data=timeline_summary,\n    x=\"time\",\n    y=\"mean_T_eff\",\n    hue=\"scenario\",\n    linewidth=2.5\n)\nplt.title(\"Therapy-Induced Effective Evolutionary Temperature\")\nplt.xlabel(\"Simulation time\")\nplt.ylabel(r\"Mean Effective Evolutionary Temperature, $T_{eff}$\")\nplt.legend(title=\"Dose scenario\", frameon=True)\nsaved_figures.append(save_current_figure(\"fig1_Teff_timeline\"))\n\n# Figure 2: Path entropy over time\nplt.figure(figsize=(11, 7))\nsns.lineplot(\n    data=timeline_summary,\n    x=\"time\",\n    y=\"mean_path_entropy\",\n    hue=\"scenario\",\n    linewidth=2.5\n)\nplt.title(\"Path Entropy of Mutation Channels\")\nplt.xlabel(\"Simulation time\")\nplt.ylabel(\"Mean Shannon Path Entropy\")\nplt.legend(title=\"Dose scenario\", frameon=True)\nsaved_figures.append(save_current_figure(\"fig2_path_entropy_timeline\"))\n\n# Figure 3: Channeling index over time\nplt.figure(figsize=(11, 7))\nsns.lineplot(\n    data=timeline_summary,\n    x=\"time\",\n    y=\"mean_channeling_index\",\n    hue=\"scenario\",\n    linewidth=2.5\n)\nplt.axhline(1.0, linestyle=\"--\", color=\"black\", linewidth=2.5, label=\"No channeling baseline\")\nplt.title(\"Specific Resistant Variant Channeling Index\")\nplt.xlabel(\"Simulation time\")\nplt.ylabel(\"Channeling Index\")\nplt.legend(title=\"Dose scenario\", frameon=True)\nsaved_figures.append(save_current_figure(\"fig3_channeling_index_timeline\"))\n\n# Figure 4: Specific channel probability vs dose\nplt.figure(figsize=(10, 7))\nsns.barplot(\n    data=scenario_summary,\n    x=\"scenario\",\n    y=\"mean_specific_channel_probability\",\n    palette=\"viridis\"\n)\nplt.title(\"Specific Resistant Pathway Probability by Dose Scenario\")\nplt.xlabel(\"Dose scenario\")\nplt.ylabel(\"Mean specific-channel probability\")\nplt.xticks(rotation=25, ha=\"right\")\nsaved_figures.append(save_current_figure(\"fig4_specific_channel_probability\"))\n\n# Figure 5: final surviving cells\nplt.figure(figsize=(10, 7))\nsns.barplot(\n    data=scenario_summary,\n    x=\"scenario\",\n    y=\"median_final_surviving_cells\",\n    palette=\"mako\"\n)\nplt.title(\"Final Surviving Tumor Cells by Dose Scenario\")\nplt.xlabel(\"Dose scenario\")\nplt.ylabel(\"Median final surviving cells\")\nplt.xticks(rotation=25, ha=\"right\")\nsaved_figures.append(save_current_figure(\"fig5_final_surviving_cells\"))\n\n# Figure 6: biophysical phase plot\nplt.figure(figsize=(10, 7))\nscatter = sns.scatterplot(\n    data=timeline_summary,\n    x=\"mean_T_eff\",\n    y=\"mean_channeling_index\",\n    hue=\"scenario\",\n    size=\"mean_path_entropy\",\n    sizes=(40, 250),\n    alpha=0.82\n)\nplt.title(r\"Biophysical Phase Map: $T_{eff}$ vs Channeling\")\nplt.xlabel(r\"Mean $T_{eff}$\")\nplt.ylabel(\"Mean Channeling Index\")\nplt.legend(title=\"Scenario / Entropy\", frameon=True, bbox_to_anchor=(1.02, 1), loc=\"upper left\")\nsaved_figures.append(save_current_figure(\"fig6_Teff_channeling_phase_map\"))\n\n# Figure 7: heatmap of main hypothesis metrics\nheatmap_df = scenario_summary.set_index(\"scenario\")[\n    [\n        \"mean_T_eff\",\n        \"mean_path_entropy\",\n        \"mean_channeling_index\",\n        \"mean_specific_channel_probability\",\n        \"probability_specific_variant_emerged\",\n        \"probability_specific_fixation\",\n    ]\n].copy()\n\n# Normalize columns for visual comparison\nheatmap_norm = heatmap_df.copy()\nfor col in heatmap_norm.columns:\n    col_min = heatmap_norm[col].min()\n    col_max = heatmap_norm[col].max()\n    if col_max > col_min:\n        heatmap_norm[col] = (heatmap_norm[col] - col_min) / (col_max - col_min)\n    else:\n        heatmap_norm[col] = 0.0\n\nplt.figure(figsize=(12, 7))\nsns.heatmap(\n    heatmap_norm,\n    annot=heatmap_df.round(3),\n    fmt=\"\",\n    cmap=\"rocket_r\",\n    linewidths=0.8,\n    cbar_kws={\"label\": \"Column-normalized intensity\"}\n)\nplt.title(\"Hypothesis Verification Metrics Across Dose Scenarios\")\nplt.xlabel(\"Metric\")\nplt.ylabel(\"Dose scenario\")\nsaved_figures.append(save_current_figure(\"fig7_hypothesis_metrics_heatmap\"))\n\n# ============================================================\n# 8. Interpretation report\n# ============================================================\n\ninterpretation_lines = []\ninterpretation_lines.append(\"# Biophysical Thermodynamic Resistance Simulation Report\")\ninterpretation_lines.append(\"\")\ninterpretation_lines.append(\"## Core Model\")\ninterpretation_lines.append(\"- Dose increases replication stress and oxidative stress.\")\ninterpretation_lines.append(\"- Stress raises effective evolutionary temperature, T_eff.\")\ninterpretation_lines.append(\"- T_eff and stress deform a free-energy-like mutation-channel landscape.\")\ninterpretation_lines.append(\"- Mutation-channel probabilities are computed using a Boltzmann-like rule: p(path_i) ∝ exp(-F_i / T_eff).\")\ninterpretation_lines.append(\"- Path entropy is Shannon entropy across mutation channels.\")\ninterpretation_lines.append(\"- Channeling Index is the APOBEC-like specific resistance pathway probability divided by the uniform random expectation.\")\ninterpretation_lines.append(\"\")\ninterpretation_lines.append(\"## Main Hypothesis Verification Metrics\")\ninterpretation_lines.append(hypothesis_metrics.to_markdown(index=False))\ninterpretation_lines.append(\"\")\ninterpretation_lines.append(\"## Output Files\")\ninterpretation_lines.append(\"| Output | Purpose | Hypothesis interpretation |\")\ninterpretation_lines.append(\"|---|---|---|\")\ninterpretation_lines.append(\"| self_contained_model_inputs.json | Synthetic input generator record | Confirms that no external data were loaded. |\")\ninterpretation_lines.append(\"| run_level_summary_compact.csv | Replicate-level compact results | Quantifies stochastic variation without storing cell-level raw data. |\")\ninterpretation_lines.append(\"| scenario_summary_metrics.csv | Dose-level final summary | Tests whether higher dose increases T_eff, entropy, resistant emergence, and channeling. |\")\ninterpretation_lines.append(\"| timeline_path_entropy_Teff_channeling.csv | Aggregated time-course metrics | Tests temporal coupling among dose, T_eff, path entropy, and channeling. |\")\ninterpretation_lines.append(\"| hypothesis_verification_metrics.csv | Minimal hypothesis table | Primary table for manuscript Results section. |\")\ninterpretation_lines.append(\"| fig1_Teff_timeline.png/pdf | T_eff over time | Supports Hypothesis 1 if higher-dose scenarios show higher T_eff. |\")\ninterpretation_lines.append(\"| fig2_path_entropy_timeline.png/pdf | Path entropy over time | Supports Hypothesis 1 if T_eff elevation is accompanied by increased path entropy. |\")\ninterpretation_lines.append(\"| fig3_channeling_index_timeline.png/pdf | Specific variant channeling over time | Supports Hypothesis 4 if high dose drives Channeling Index above 1. |\")\ninterpretation_lines.append(\"| fig4_specific_channel_probability.png/pdf | Specific pathway probability | Supports Hypothesis 4 if APOBEC-like pathway probability increases with dose/stress. |\")\ninterpretation_lines.append(\"| fig5_final_surviving_cells.png/pdf | Final surviving tumor cells | Connects thermodynamic pathway effects to tumor population outcome. |\")\ninterpretation_lines.append(\"| fig6_Teff_channeling_phase_map.png/pdf | T_eff-channeling phase map | Shows whether high T_eff states occupy a high-channeling regime. |\")\ninterpretation_lines.append(\"| fig7_hypothesis_metrics_heatmap.png/pdf | Integrated metrics heatmap | Provides a compact manuscript figure for both hypotheses. |\")\ninterpretation_lines.append(\"\")\ninterpretation_lines.append(\"## Manuscript Hypotheses\")\ninterpretation_lines.append(\"1. Therapy-Induced Evolutionary Temperature Hypothesis: Higher treatment dose increases replication and oxidative stress, raising effective evolutionary temperature and thereby increasing stochastic mutational exploration.\")\ninterpretation_lines.append(\"2. Path Entropy Hypothesis: Higher effective evolutionary temperature increases Shannon path entropy across mutation channels, reflecting broader mutational pathway diversity.\")\ninterpretation_lines.append(\"3. Specific Variant Channeling Hypothesis: Treatment stress does not merely increase random mutation noise; it deforms the free-energy landscape and enriches the APOBEC-like specific resistant pathway beyond the uniform random expectation.\")\ninterpretation_lines.append(\"4. Biophysical Resistance Coupling Hypothesis: The combination of high T_eff, elevated path entropy, and Channeling Index > 1 predicts increased emergence and fixation probability of a specific resistant clone.\")\n\nreport_path = os.path.join(OUTPUT_DIR, \"biophysical_thermodynamic_interpretation_report.md\")\nwith open(report_path, \"w\", encoding=\"utf-8\") as f:\n    f.write(\"\\n\".join(interpretation_lines))","metadata":{"trusted":true},"outputs":[],"execution_count":null},{"cell_type":"code","source":"# ============================================================\n# 9. Required final screen output\n# ============================================================\n\nprint(\"\\n\" + \"=\" * 90)\nprint(\"STOCHASTIC SIMULATION COMPLETE\")\nprint(\"=\" * 90)\nprint(f\"Output directory: {OUTPUT_DIR}\")\nprint(\"\\n[Primary Summary DataFrame: hypothesis_verification_metrics]\")\nprint(hypothesis_metrics.to_string(index=False))\nprint(\"\\n\" + \"=\" * 90)\nprint(\"MANDATORY OUTPUT LIST AND INTERPRETATION GUIDE\")\nprint(\"=\" * 90)\n\noutput_table = pd.DataFrame([\n    {\n        \"Output\": \"self_contained_model_inputs.json\",\n        \"Type\": \"Input record\",\n        \"Interpretation\": \"Documents internally generated synthetic population, dose scenarios, and free-energy parameters.\"\n    },\n    {\n        \"Output\": \"run_level_summary_compact.csv\",\n        \"Type\": \"CSV\",\n        \"Interpretation\": \"Replicate-level compact metrics; use for uncertainty and stochastic variation.\"\n    },\n    {\n        \"Output\": \"scenario_summary_metrics.csv\",\n        \"Type\": \"CSV\",\n        \"Interpretation\": \"Dose-level summary; compare final surviving cells, mean T_eff, entropy, and channeling.\"\n    },\n    {\n        \"Output\": \"timeline_path_entropy_Teff_channeling.csv\",\n        \"Type\": \"CSV\",\n        \"Interpretation\": \"Time-resolved aggregated metrics; use to test temporal order: dose → stress → T_eff → entropy/channeling.\"\n    },\n    {\n        \"Output\": \"hypothesis_verification_metrics.csv\",\n        \"Type\": \"CSV\",\n        \"Interpretation\": \"Primary manuscript table for Hypothesis 1 and Hypothesis 4.\"\n    },\n    {\n        \"Output\": \"fig1_Teff_timeline.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Hypothesis 1 is supported if higher-dose scenarios show higher T_eff.\"\n    },\n    {\n        \"Output\": \"fig2_path_entropy_timeline.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Hypothesis 1 is supported if path entropy increases with T_eff and dose.\"\n    },\n    {\n        \"Output\": \"fig3_channeling_index_timeline.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Hypothesis 4 is supported if Channeling Index exceeds 1 under high stress.\"\n    },\n    {\n        \"Output\": \"fig4_specific_channel_probability.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Hypothesis 4 is supported if APOBEC-like specific pathway probability rises with dose.\"\n    },\n    {\n        \"Output\": \"fig5_final_surviving_cells.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Links biophysical mutation dynamics to tumor population survival.\"\n    },\n    {\n        \"Output\": \"fig6_Teff_channeling_phase_map.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Shows whether high-T_eff states occupy a high-channeling regime.\"\n    },\n    {\n        \"Output\": \"fig7_hypothesis_metrics_heatmap.png/pdf\",\n        \"Type\": \"Figure\",\n        \"Interpretation\": \"Integrated overview of T_eff, entropy, channeling, emergence, and fixation.\"\n    },\n    {\n        \"Output\": \"biophysical_thermodynamic_interpretation_report.md\",\n        \"Type\": \"Markdown report\",\n        \"Interpretation\": \"Ready-to-use interpretation guide for manuscript Results and Discussion.\"\n    },\n])\n\nprint(output_table.to_markdown(index=False))\nprint(\"\\n\" + \"=\" * 90)\nprint(\"BIOPHYSICAL AND BIOLOGICAL INTERPRETATION\")\nprint(\"=\" * 90)\nprint(\n    \"Hypothesis 1 interpretation: If dose escalation increases mean_T_eff and mean_path_entropy, \"\n    \"the simulation supports the idea that therapy-induced replication/oxidative stress raises \"\n    \"effective evolutionary temperature and broadens mutational pathway exploration.\"\n)\nprint(\n    \"Hypothesis 4 interpretation: If mean_channeling_index > 1 and specific_channel_probability \"\n    \"increases under high-dose or pulsed-high-dose scenarios, the simulation supports specific \"\n    \"variant channeling beyond uniform random mutational noise.\"\n)\nprint(\n    \"Physical interpretation: The model treats resistant mutation channels as states on a \"\n    \"dose-deformed free-energy landscape. T_eff controls stochastic exploration, while stress-dependent \"\n    \"free-energy lowering enriches the APOBEC-like specific resistance path.\"\n)\nprint(\n    \"Biological interpretation: Replication stress and oxidative stress increase occupancy of the \"\n    \"mutagenic repair state, increasing mutation production and biasing variant output toward \"\n    \"stress-coupled resistant channels.\"\n)\nprint(\"\\n\" + \"=\" * 90)\nprint(\"FILES SAVED\")\nprint(\"=\" * 90)\n\nfor path in [\n    os.path.join(OUTPUT_DIR, \"self_contained_model_inputs.json\"),\n    run_level_summary_path,\n    scenario_summary_path,\n    timeline_summary_path,\n    hypothesis_metrics_path,\n    report_path,\n]:\n    print(path)\n\nfor fig_pair in saved_figures:\n    for fig_path in fig_pair:\n        print(fig_path)\n\nprint(\"\\n\" + \"=\" * 90)\nprint(\"MANUSCRIPT HYPOTHESES TO TEST\")\nprint(\"=\" * 90)\nprint(\"H1. Therapy-Induced Evolutionary Temperature: Higher dose raises replication/oxidative stress and increases T_eff.\")\nprint(\"H2. Path Entropy Expansion: Higher T_eff increases Shannon path entropy across resistant mutation channels.\")\nprint(\"H3. Mutagenic Repair Occupancy: Higher dose increases transition from normal fidelity replication to mutagenic repair.\")\nprint(\"H4. Specific Variant Channeling: Stress deforms the free-energy landscape and enriches the APOBEC-like specific resistance pathway beyond random expectation.\")\nprint(\"H5. Resistance Outcome Coupling: High T_eff plus high Channeling Index predicts earlier emergence or fixation of the specific resistant clone.\")\nprint(\"=\" * 90)","metadata":{"trusted":true},"outputs":[],"execution_count":null}]}
+# ============================================================
+# Stochastic Simulation of Cancer Therapy Resistance
+# Based on Biophysical Thermodynamics
+# ------------------------------------------------------------
+# One-run, self-contained Kaggle-ready Python code
+# No external input files required
+# Outputs: compact summary tables + high-resolution figures
+# ============================================================
+
+import os
+import math
+import json
+import warnings
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 1. Global configuration
+# ============================================================
+
+RANDOM_SEED = 20260701
+rng = np.random.default_rng(RANDOM_SEED)
+
+OUTPUT_DIR = "/kaggle/working/biophysical_thermodynamic_resistance_outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Required publication-ready style
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelsize": 16,
+    "axes.titlesize": 18,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "figure.titlesize": 20,
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "axes.linewidth": 1.4,
+    "lines.linewidth": 2.5,
+    "lines.markersize": 7,
+    "legend.fontsize": 12,
+    "legend.title_fontsize": 13,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+sns.set_theme(style="whitegrid", context="talk")
+
+# ============================================================
+# 2. Model definitions
+# ============================================================
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    n_steps: int = 260
+    dt: float = 1.0
+    n_replicates: int = 160
+
+    initial_sensitive: int = 250000
+    initial_resistant_total: int = 0
+
+    carrying_capacity: int = 2000000
+
+    base_sensitive_growth: float = 0.030
+    base_resistant_growth: float = 0.026
+    base_death: float = 0.010
+
+    baseline_mutation_rate: float = 1.2e-5
+    mutagenic_multiplier: float = 8.0
+
+    normal_to_mutagenic_base: float = 0.002
+    mutagenic_to_normal_base: float = 0.070
+
+    drug_kill_sensitive: float = 0.060
+    drug_kill_mutagenic: float = 0.035
+    drug_kill_resistant: float = 0.010
+
+    t_eff_baseline: float = 1.0
+    t_eff_dose_coeff: float = 1.05
+    t_eff_replication_coeff: float = 0.85
+    t_eff_oxidative_coeff: float = 0.70
+    t_eff_noise_floor: float = 0.05
+
+    entropy_epsilon: float = 1e-12
+
+    specific_variant_name: str = "APOBEC_like_specific_resistance"
+    fixation_fraction_threshold: float = 0.60
+
+@dataclass(frozen=True)
+class DoseScenario:
+    scenario_name: str
+    dose: float
+    schedule_type: str
+
+CONFIG = SimulationConfig()
+
+# Dose scenarios: low, medium, high continuous therapy
+DOSE_SCENARIOS = [
+    DoseScenario("low_continuous_dose", 0.25, "continuous"),
+    DoseScenario("medium_continuous_dose", 0.55, "continuous"),
+    DoseScenario("high_continuous_dose", 0.90, "continuous"),
+    DoseScenario("pulsed_high_dose", 0.90, "pulsed"),
+]
+
+# Mutation channels
+# A = neutral/random-like
+# B = APOBEC-like specific resistant variant
+# C = DSB/SV-like resistant variant
+# D = other resistant route
+MUTATION_CHANNELS = [
+    "neutral_random_like",
+    "APOBEC_like_specific_resistance",
+    "DSB_SV_like_resistance",
+    "other_resistance_route",
+]
+
+CHANNEL_BASE_FREE_ENERGY = {
+    "neutral_random_like": 0.00,
+    "APOBEC_like_specific_resistance": 1.15,
+    "DSB_SV_like_resistance": 1.45,
+    "other_resistance_route": 1.25,
+}
+
+CHANNEL_STRESS_COUPLING = {
+    "neutral_random_like": 0.10,
+    "APOBEC_like_specific_resistance": 1.35,
+    "DSB_SV_like_resistance": 0.95,
+    "other_resistance_route": 0.55,
+}
+
+CHANNEL_RESISTANCE_GROWTH_MODIFIER = {
+    "neutral_random_like": 0.000,
+    "APOBEC_like_specific_resistance": 0.008,
+    "DSB_SV_like_resistance": 0.005,
+    "other_resistance_route": 0.004,
+}
+# ============================================================
+# 3. Self-contained input generator
+# ============================================================
+
+def generate_self_contained_inputs(config: SimulationConfig) -> Dict:
+    """
+    Generates all synthetic initial conditions and scenarios internally.
+    No external files are required.
+    """
+    initial_population = {
+        "sensitive_normal_fidelity": config.initial_sensitive,
+        "sensitive_mutagenic_repair": 0,
+        "neutral_random_like": 0,
+        "APOBEC_like_specific_resistance": 0,
+        "DSB_SV_like_resistance": 0,
+        "other_resistance_route": 0,
+    }
+
+    scenarios = [asdict(s) for s in DOSE_SCENARIOS]
+
+    model_metadata = {
+        "study_title": "Stochastic Simulation of Cancer Therapy Resistance Based on Biophysical Thermodynamics",
+        "core_mechanism": (
+            "Dose increases replication and oxidative stress; stress raises effective evolutionary temperature; "
+            "temperature and stress reshape the free-energy landscape of mutation channels; "
+            "reshaped channel probabilities bias resistant variant emergence."
+        ),
+        "random_seed": RANDOM_SEED,
+        "config": asdict(config),
+        "mutation_channels": MUTATION_CHANNELS,
+        "channel_base_free_energy": CHANNEL_BASE_FREE_ENERGY,
+        "channel_stress_coupling": CHANNEL_STRESS_COUPLING,
+    }
+
+    return {
+        "initial_population": initial_population,
+        "scenarios": scenarios,
+        "metadata": model_metadata,
+    }
+
+# ============================================================
+# 4. Biophysical thermodynamic functions
+# ============================================================
+
+def schedule_dose(scenario: DoseScenario, step: int) -> float:
+    """
+    Continuous and pulsed dose schedules.
+    Pulsed high dose: 14 days on, 14 days off.
+    """
+    if scenario.schedule_type == "continuous":
+        return scenario.dose
+    if scenario.schedule_type == "pulsed":
+        cycle = 28
+        return scenario.dose if (step % cycle) < 14 else 0.0
+    raise ValueError(f"Unknown schedule type: {scenario.schedule_type}")
+
+def compute_stress_variables(dose: float, total_cells: int, config: SimulationConfig) -> Tuple[float, float]:
+    """
+    Replication stress and oxidative stress are synthetic mechanistic variables.
+    They increase with dose and crowding pressure.
+    """
+    crowding_pressure = min(total_cells / max(config.carrying_capacity, 1), 1.5)
+    replication_stress = np.clip(0.15 + 0.85 * dose + 0.25 * crowding_pressure, 0.0, 2.0)
+    oxidative_stress = np.clip(0.10 + 0.75 * dose + 0.15 * crowding_pressure, 0.0, 2.0)
+    return replication_stress, oxidative_stress
+
+def compute_effective_evolutionary_temperature(
+    dose: float,
+    replication_stress: float,
+    oxidative_stress: float,
+    config: SimulationConfig
+) -> float:
+    """
+    Effective evolutionary temperature proxy.
+    Higher dose and stress increase stochasticity of evolutionary search.
+    """
+    t_eff = (
+        config.t_eff_baseline
+        + config.t_eff_dose_coeff * dose
+        + config.t_eff_replication_coeff * replication_stress
+        + config.t_eff_oxidative_coeff * oxidative_stress
+        + config.t_eff_noise_floor
+    )
+    return max(t_eff, 0.05)
+
+def free_energy_landscape(
+    dose: float,
+    replication_stress: float,
+    oxidative_stress: float
+) -> Dict[str, float]:
+    """
+    Dose/stress-dependent free-energy landscape deformation.
+    Lower effective free energy gives higher channel probability.
+    APOBEC-like channel is deliberately stress-coupled to represent
+    specific variant channeling beyond random noise.
+    """
+    composite_stress = 0.65 * replication_stress + 0.35 * oxidative_stress
+
+    energies = {}
+    for channel in MUTATION_CHANNELS:
+        base_energy = CHANNEL_BASE_FREE_ENERGY[channel]
+        stress_coupling = CHANNEL_STRESS_COUPLING[channel]
+        nonlinear_channeling = 0.0
+
+        if channel == "APOBEC_like_specific_resistance":
+            nonlinear_channeling = 0.75 * (dose ** 2) + 0.45 * max(replication_stress - 0.8, 0.0) ** 2
+        elif channel == "DSB_SV_like_resistance":
+            nonlinear_channeling = 0.35 * (oxidative_stress ** 2)
+
+        energies[channel] = base_energy - stress_coupling * composite_stress - nonlinear_channeling
+
+    return energies
+
+def softmax_channel_probabilities(
+    energies: Dict[str, float],
+    t_eff: float,
+    config: SimulationConfig
+) -> Dict[str, float]:
+    """
+    Boltzmann-like mapping:
+    p(path_i) ∝ exp(-F_i / T_eff)
+    T_eff controls stochastic exploration; free-energy deformation controls channeling.
+    """
+    energy_array = np.array([energies[ch] for ch in MUTATION_CHANNELS], dtype=float)
+    logits = -energy_array / max(t_eff, config.entropy_epsilon)
+    logits = logits - logits.max()
+    weights = np.exp(logits)
+    probs = weights / weights.sum()
+    return {ch: float(p) for ch, p in zip(MUTATION_CHANNELS, probs)}
+
+def shannon_entropy(probabilities: Dict[str, float], config: SimulationConfig) -> float:
+    """
+    Shannon path entropy over mutation channels.
+    H = -sum p_i log(p_i)
+    """
+    p = np.array(list(probabilities.values()), dtype=float)
+    p = np.clip(p, config.entropy_epsilon, 1.0)
+    return float(-np.sum(p * np.log(p)))
+
+def normalized_entropy(probabilities: Dict[str, float], config: SimulationConfig) -> float:
+    return shannon_entropy(probabilities, config) / np.log(len(probabilities))
+
+def channeling_index(probabilities: Dict[str, float], specific_channel: str) -> float:
+    """
+    Channeling Index:
+    specific channel probability / uniform expectation.
+    If >1, the specific resistant pathway is enriched beyond random uniform channel use.
+    """
+    uniform_prob = 1.0 / len(probabilities)
+    return probabilities[specific_channel] / uniform_prob
+# ============================================================
+# 5. Memory-efficient stochastic simulation
+# ============================================================
+
+def simulate_one_replicate(
+    scenario: DoseScenario,
+    config: SimulationConfig,
+    replicate_seed: int
+) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Aggregated stochastic simulation.
+    No individual-cell data are stored.
+    Only compact time-step summaries are retained.
+    """
+    local_rng = np.random.default_rng(replicate_seed)
+
+    sensitive_normal = int(config.initial_sensitive)
+    sensitive_mutagenic = 0
+
+    resistant_counts = {ch: 0 for ch in MUTATION_CHANNELS}
+
+    timeline_records = []
+
+    cumulative_specific_variants = 0
+    cumulative_all_variants = 0
+    cumulative_path_entropy = 0.0
+    cumulative_t_eff = 0.0
+
+    time_to_first_specific = np.nan
+    time_to_resistant_fixation = np.nan
+
+    for step in range(config.n_steps):
+        dose = schedule_dose(scenario, step)
+
+        total_resistant = int(sum(resistant_counts.values()))
+        total_sensitive = int(sensitive_normal + sensitive_mutagenic)
+        total_cells = int(total_sensitive + total_resistant)
+
+        if total_cells <= 0:
+            replication_stress = 0.0
+            oxidative_stress = 0.0
+            t_eff = config.t_eff_baseline
+            energies = free_energy_landscape(dose, replication_stress, oxidative_stress)
+            channel_probs = softmax_channel_probabilities(energies, t_eff, config)
+            path_h = shannon_entropy(channel_probs, config)
+            path_h_norm = normalized_entropy(channel_probs, config)
+            channel_idx = channeling_index(channel_probs, config.specific_variant_name)
+
+            timeline_records.append({
+                "step": step,
+                "time": step * config.dt,
+                "scenario": scenario.scenario_name,
+                "dose": dose,
+                "total_cells": 0,
+                "sensitive_normal": 0,
+                "sensitive_mutagenic": 0,
+                "total_sensitive": 0,
+                "total_resistant": 0,
+                "specific_resistant_count": 0,
+                "specific_resistant_fraction": 0.0,
+                "replication_stress": replication_stress,
+                "oxidative_stress": oxidative_stress,
+                "T_eff": t_eff,
+                "path_entropy": path_h,
+                "normalized_path_entropy": path_h_norm,
+                "channeling_index": channel_idx,
+                "specific_channel_probability": channel_probs[config.specific_variant_name],
+                "cumulative_specific_variants": cumulative_specific_variants,
+                "cumulative_all_variants": cumulative_all_variants,
+            })
+            continue
+
+        replication_stress, oxidative_stress = compute_stress_variables(dose, total_cells, config)
+        t_eff = compute_effective_evolutionary_temperature(dose, replication_stress, oxidative_stress, config)
+        energies = free_energy_landscape(dose, replication_stress, oxidative_stress)
+        channel_probs = softmax_channel_probabilities(energies, t_eff, config)
+
+        path_h = shannon_entropy(channel_probs, config)
+        path_h_norm = normalized_entropy(channel_probs, config)
+        channel_idx = channeling_index(channel_probs, config.specific_variant_name)
+
+        crowding_factor = max(0.0, 1.0 - total_cells / config.carrying_capacity)
+
+        # State transition: normal fidelity -> mutagenic repair
+        p_to_mutagenic = np.clip(
+            config.normal_to_mutagenic_base
+            * (1.0 + 1.35 * dose + 0.85 * replication_stress + 0.55 * oxidative_stress),
+            0.0,
+            0.30
+        )
+
+        # Recovery: mutagenic repair -> normal fidelity
+        p_to_normal = np.clip(
+            config.mutagenic_to_normal_base / (1.0 + 0.75 * dose + 0.45 * replication_stress),
+            0.0,
+            0.25
+        )
+
+        new_mutagenic = local_rng.binomial(sensitive_normal, p_to_mutagenic) if sensitive_normal > 0 else 0
+        recovered_normal = local_rng.binomial(sensitive_mutagenic, p_to_normal) if sensitive_mutagenic > 0 else 0
+
+        sensitive_normal = sensitive_normal - new_mutagenic + recovered_normal
+        sensitive_mutagenic = sensitive_mutagenic + new_mutagenic - recovered_normal
+
+        # Growth and death: aggregated binomial/Poisson updates
+        p_birth_sensitive_normal = np.clip(config.base_sensitive_growth * crowding_factor, 0.0, 0.50)
+        p_birth_sensitive_mutagenic = np.clip(config.base_sensitive_growth * 0.82 * crowding_factor, 0.0, 0.50)
+
+        births_normal = local_rng.binomial(sensitive_normal, p_birth_sensitive_normal) if sensitive_normal > 0 else 0
+        births_mutagenic = local_rng.binomial(sensitive_mutagenic, p_birth_sensitive_mutagenic) if sensitive_mutagenic > 0 else 0
+
+        p_death_normal = np.clip(config.base_death + config.drug_kill_sensitive * dose, 0.0, 0.90)
+        p_death_mutagenic = np.clip(config.base_death + config.drug_kill_mutagenic * dose + 0.004 * oxidative_stress, 0.0, 0.90)
+
+        deaths_normal = local_rng.binomial(sensitive_normal, p_death_normal) if sensitive_normal > 0 else 0
+        deaths_mutagenic = local_rng.binomial(sensitive_mutagenic, p_death_mutagenic) if sensitive_mutagenic > 0 else 0
+
+        sensitive_normal = max(0, sensitive_normal + births_normal - deaths_normal)
+        sensitive_mutagenic = max(0, sensitive_mutagenic + births_mutagenic - deaths_mutagenic)
+
+        # Stress-dependent mutation rate
+        effective_mutation_rate_normal = config.baseline_mutation_rate * (1.0 + 0.30 * (t_eff - config.t_eff_baseline))
+        effective_mutation_rate_mutagenic = (
+            config.baseline_mutation_rate
+            * config.mutagenic_multiplier
+            * (1.0 + 0.65 * (t_eff - config.t_eff_baseline))
+        )
+
+        effective_mutation_rate_normal = np.clip(effective_mutation_rate_normal, 0.0, 0.05)
+        effective_mutation_rate_mutagenic = np.clip(effective_mutation_rate_mutagenic, 0.0, 0.15)
+
+        mutation_trials_normal = max(0, births_normal)
+        mutation_trials_mutagenic = max(0, births_mutagenic)
+
+        n_mutations_normal = local_rng.binomial(mutation_trials_normal, effective_mutation_rate_normal) if mutation_trials_normal > 0 else 0
+        n_mutations_mutagenic = local_rng.binomial(mutation_trials_mutagenic, effective_mutation_rate_mutagenic) if mutation_trials_mutagenic > 0 else 0
+        n_new_mutations = int(n_mutations_normal + n_mutations_mutagenic)
+
+        if n_new_mutations > 0:
+            probs_array = np.array([channel_probs[ch] for ch in MUTATION_CHANNELS])
+            new_channel_counts = local_rng.multinomial(n_new_mutations, probs_array)
+
+            for channel, count in zip(MUTATION_CHANNELS, new_channel_counts):
+                resistant_counts[channel] += int(count)
+
+            specific_new = int(new_channel_counts[MUTATION_CHANNELS.index(config.specific_variant_name)])
+            cumulative_specific_variants += specific_new
+            cumulative_all_variants += n_new_mutations
+
+            if specific_new > 0 and np.isnan(time_to_first_specific):
+                time_to_first_specific = step * config.dt
+
+            # Mutated cells are removed from sensitive compartments in aggregate
+            remove_from_mutagenic = min(sensitive_mutagenic, n_mutations_mutagenic)
+            sensitive_mutagenic -= remove_from_mutagenic
+            remove_from_normal = min(sensitive_normal, n_new_mutations - remove_from_mutagenic)
+            sensitive_normal -= remove_from_normal
+
+        # Resistant clone growth/death by channel
+        for channel in MUTATION_CHANNELS:
+            count = resistant_counts[channel]
+            if count <= 0:
+                continue
+
+            channel_growth = (
+                config.base_resistant_growth
+                + CHANNEL_RESISTANCE_GROWTH_MODIFIER[channel]
+            ) * crowding_factor
+
+            p_birth_resistant = np.clip(channel_growth, 0.0, 0.50)
+            p_death_resistant = np.clip(config.base_death + config.drug_kill_resistant * dose, 0.0, 0.80)
+
+            births_resistant = local_rng.binomial(count, p_birth_resistant)
+            deaths_resistant = local_rng.binomial(count, p_death_resistant)
+            resistant_counts[channel] = max(0, count + births_resistant - deaths_resistant)
+
+        total_resistant = int(sum(resistant_counts.values()))
+        total_sensitive = int(sensitive_normal + sensitive_mutagenic)
+        total_cells = int(total_sensitive + total_resistant)
+
+        specific_count = int(resistant_counts[config.specific_variant_name])
+        specific_resistant_fraction = specific_count / max(total_resistant, 1)
+
+        if (
+            np.isnan(time_to_resistant_fixation)
+            and total_resistant > 0
+            and specific_resistant_fraction >= config.fixation_fraction_threshold
+            and specific_count >= 50
+        ):
+            time_to_resistant_fixation = step * config.dt
+
+        cumulative_path_entropy += path_h
+        cumulative_t_eff += t_eff
+
+        timeline_records.append({
+            "step": step,
+            "time": step * config.dt,
+            "scenario": scenario.scenario_name,
+            "dose": dose,
+            "total_cells": total_cells,
+            "sensitive_normal": sensitive_normal,
+            "sensitive_mutagenic": sensitive_mutagenic,
+            "total_sensitive": total_sensitive,
+            "total_resistant": total_resistant,
+            "specific_resistant_count": specific_count,
+            "specific_resistant_fraction": specific_resistant_fraction,
+            "replication_stress": replication_stress,
+            "oxidative_stress": oxidative_stress,
+            "T_eff": t_eff,
+            "path_entropy": path_h,
+            "normalized_path_entropy": path_h_norm,
+            "channeling_index": channel_idx,
+            "specific_channel_probability": channel_probs[config.specific_variant_name],
+            "cumulative_specific_variants": cumulative_specific_variants,
+            "cumulative_all_variants": cumulative_all_variants,
+        })
+
+    timeline_df = pd.DataFrame(timeline_records)
+
+    final_row = timeline_df.iloc[-1].to_dict()
+    summary = {
+        "scenario": scenario.scenario_name,
+        "nominal_dose": scenario.dose,
+        "schedule_type": scenario.schedule_type,
+        "final_surviving_cells": int(final_row["total_cells"]),
+        "final_sensitive_cells": int(final_row["total_sensitive"]),
+        "final_resistant_cells": int(final_row["total_resistant"]),
+        "final_specific_resistant_count": int(final_row["specific_resistant_count"]),
+        "final_specific_resistant_fraction_among_resistant": float(final_row["specific_resistant_fraction"]),
+        "final_T_eff": float(final_row["T_eff"]),
+        "mean_T_eff": float(timeline_df["T_eff"].mean()),
+        "final_path_entropy": float(final_row["path_entropy"]),
+        "mean_path_entropy": float(timeline_df["path_entropy"].mean()),
+        "mean_normalized_path_entropy": float(timeline_df["normalized_path_entropy"].mean()),
+        "final_channeling_index": float(final_row["channeling_index"]),
+        "mean_channeling_index": float(timeline_df["channeling_index"].mean()),
+        "final_specific_channel_probability": float(final_row["specific_channel_probability"]),
+        "cumulative_specific_variants": int(final_row["cumulative_specific_variants"]),
+        "cumulative_all_variants": int(final_row["cumulative_all_variants"]),
+        "observed_specific_variant_share": (
+            float(final_row["cumulative_specific_variants"] / max(final_row["cumulative_all_variants"], 1))
+        ),
+        "time_to_first_specific_variant": time_to_first_specific,
+        "time_to_specific_resistant_fixation": time_to_resistant_fixation,
+    }
+
+    return timeline_df, summary
+
+def run_full_experiment(config: SimulationConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Runs all dose scenarios and replicates.
+    Stores compact time-average summaries and representative averaged timelines.
+    """
+    all_summaries = []
+    timeline_accumulators = []
+
+    run_counter = 0
+
+    for scenario in DOSE_SCENARIOS:
+        scenario_timelines = []
+
+        for rep in range(config.n_replicates):
+            run_counter += 1
+            seed = RANDOM_SEED + run_counter * 101
+            timeline_df, summary = simulate_one_replicate(scenario, config, seed)
+
+            summary["replicate"] = rep
+            summary["seed"] = seed
+            all_summaries.append(summary)
+
+            # Store aggregated timeline only; no cell-level raw data.
+            reduced_timeline = timeline_df[
+                [
+                    "time",
+                    "scenario",
+                    "dose",
+                    "total_cells",
+                    "total_sensitive",
+                    "total_resistant",
+                    "specific_resistant_count",
+                    "specific_resistant_fraction",
+                    "replication_stress",
+                    "oxidative_stress",
+                    "T_eff",
+                    "path_entropy",
+                    "normalized_path_entropy",
+                    "channeling_index",
+                    "specific_channel_probability",
+                    "cumulative_specific_variants",
+                    "cumulative_all_variants",
+                ]
+            ].copy()
+            reduced_timeline["replicate"] = rep
+            scenario_timelines.append(reduced_timeline)
+
+        scenario_timeline_df = pd.concat(scenario_timelines, ignore_index=True)
+
+        aggregated_timeline = (
+            scenario_timeline_df
+            .groupby(["scenario", "time"], as_index=False)
+            .agg(
+                mean_dose=("dose", "mean"),
+                median_total_cells=("total_cells", "median"),
+                mean_total_cells=("total_cells", "mean"),
+                median_total_resistant=("total_resistant", "median"),
+                mean_total_resistant=("total_resistant", "mean"),
+                median_specific_resistant_count=("specific_resistant_count", "median"),
+                mean_specific_resistant_count=("specific_resistant_count", "mean"),
+                mean_specific_resistant_fraction=("specific_resistant_fraction", "mean"),
+                mean_replication_stress=("replication_stress", "mean"),
+                mean_oxidative_stress=("oxidative_stress", "mean"),
+                mean_T_eff=("T_eff", "mean"),
+                mean_path_entropy=("path_entropy", "mean"),
+                mean_normalized_path_entropy=("normalized_path_entropy", "mean"),
+                mean_channeling_index=("channeling_index", "mean"),
+                mean_specific_channel_probability=("specific_channel_probability", "mean"),
+                mean_cumulative_specific_variants=("cumulative_specific_variants", "mean"),
+                mean_cumulative_all_variants=("cumulative_all_variants", "mean"),
+            )
+        )
+
+        timeline_accumulators.append(aggregated_timeline)
+
+    run_level_summary = pd.DataFrame(all_summaries)
+    timeline_summary = pd.concat(timeline_accumulators, ignore_index=True)
+
+    return run_level_summary, timeline_summary
+# ============================================================
+# 6. Run simulation
+# ============================================================
+
+inputs = generate_self_contained_inputs(CONFIG)
+with open(os.path.join(OUTPUT_DIR, "self_contained_model_inputs.json"), "w", encoding="utf-8") as f:
+    json.dump(inputs, f, indent=2)
+
+run_level_summary, timeline_summary = run_full_experiment(CONFIG)
+
+# Scenario-level summary
+scenario_summary = (
+    run_level_summary
+    .groupby(["scenario", "nominal_dose", "schedule_type"], as_index=False)
+    .agg(
+        n_replicates=("replicate", "count"),
+        median_final_surviving_cells=("final_surviving_cells", "median"),
+        mean_final_surviving_cells=("final_surviving_cells", "mean"),
+        median_final_resistant_cells=("final_resistant_cells", "median"),
+        mean_final_resistant_cells=("final_resistant_cells", "mean"),
+        median_final_specific_resistant_count=("final_specific_resistant_count", "median"),
+        mean_final_specific_resistant_count=("final_specific_resistant_count", "mean"),
+        mean_T_eff=("mean_T_eff", "mean"),
+        mean_path_entropy=("mean_path_entropy", "mean"),
+        mean_normalized_path_entropy=("mean_normalized_path_entropy", "mean"),
+        mean_channeling_index=("mean_channeling_index", "mean"),
+        final_channeling_index_median=("final_channeling_index", "median"),
+        mean_specific_channel_probability=("final_specific_channel_probability", "mean"),
+        mean_observed_specific_variant_share=("observed_specific_variant_share", "mean"),
+        median_cumulative_specific_variants=("cumulative_specific_variants", "median"),
+        median_cumulative_all_variants=("cumulative_all_variants", "median"),
+        probability_specific_variant_emerged=("time_to_first_specific_variant", lambda x: float(np.mean(~pd.isna(x)))),
+        median_time_to_first_specific_variant=("time_to_first_specific_variant", lambda x: float(pd.Series(x).dropna().median()) if pd.Series(x).dropna().shape[0] > 0 else np.nan),
+        probability_specific_fixation=("time_to_specific_resistant_fixation", lambda x: float(np.mean(~pd.isna(x)))),
+        median_time_to_specific_fixation=("time_to_specific_resistant_fixation", lambda x: float(pd.Series(x).dropna().median()) if pd.Series(x).dropna().shape[0] > 0 else np.nan),
+    )
+)
+
+# Hypothesis-specific compact table
+hypothesis_metrics = scenario_summary[
+    [
+        "scenario",
+        "nominal_dose",
+        "schedule_type",
+        "median_final_surviving_cells",
+        "mean_T_eff",
+        "mean_path_entropy",
+        "mean_normalized_path_entropy",
+        "mean_channeling_index",
+        "mean_specific_channel_probability",
+        "mean_observed_specific_variant_share",
+        "probability_specific_variant_emerged",
+        "probability_specific_fixation",
+        "median_time_to_first_specific_variant",
+        "median_time_to_specific_fixation",
+    ]
+].copy()
+
+# Save compact outputs only
+run_level_summary_path = os.path.join(OUTPUT_DIR, "run_level_summary_compact.csv")
+scenario_summary_path = os.path.join(OUTPUT_DIR, "scenario_summary_metrics.csv")
+timeline_summary_path = os.path.join(OUTPUT_DIR, "timeline_path_entropy_Teff_channeling.csv")
+hypothesis_metrics_path = os.path.join(OUTPUT_DIR, "hypothesis_verification_metrics.csv")
+
+run_level_summary.to_csv(run_level_summary_path, index=False)
+scenario_summary.to_csv(scenario_summary_path, index=False)
+timeline_summary.to_csv(timeline_summary_path, index=False)
+hypothesis_metrics.to_csv(hypothesis_metrics_path, index=False)
+
+# ============================================================
+# 7. Publication-ready visualization
+# ============================================================
+
+def save_current_figure(filename_base: str):
+    png_path = os.path.join(OUTPUT_DIR, f"{filename_base}.png")
+    pdf_path = os.path.join(OUTPUT_DIR, f"{filename_base}.pdf")
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.savefig(pdf_path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.show()
+    return png_path, pdf_path
+
+saved_figures = []
+
+# Figure 1: T_eff over time
+plt.figure(figsize=(11, 7))
+sns.lineplot(
+    data=timeline_summary,
+    x="time",
+    y="mean_T_eff",
+    hue="scenario",
+    linewidth=2.5
+)
+plt.title("Therapy-Induced Effective Evolutionary Temperature")
+plt.xlabel("Simulation time")
+plt.ylabel(r"Mean Effective Evolutionary Temperature, $T_{eff}$")
+plt.legend(title="Dose scenario", frameon=True)
+saved_figures.append(save_current_figure("fig1_Teff_timeline"))
+
+# Figure 2: Path entropy over time
+plt.figure(figsize=(11, 7))
+sns.lineplot(
+    data=timeline_summary,
+    x="time",
+    y="mean_path_entropy",
+    hue="scenario",
+    linewidth=2.5
+)
+plt.title("Path Entropy of Mutation Channels")
+plt.xlabel("Simulation time")
+plt.ylabel("Mean Shannon Path Entropy")
+plt.legend(title="Dose scenario", frameon=True)
+saved_figures.append(save_current_figure("fig2_path_entropy_timeline"))
+
+# Figure 3: Channeling index over time
+plt.figure(figsize=(11, 7))
+sns.lineplot(
+    data=timeline_summary,
+    x="time",
+    y="mean_channeling_index",
+    hue="scenario",
+    linewidth=2.5
+)
+plt.axhline(1.0, linestyle="--", color="black", linewidth=2.5, label="No channeling baseline")
+plt.title("Specific Resistant Variant Channeling Index")
+plt.xlabel("Simulation time")
+plt.ylabel("Channeling Index")
+plt.legend(title="Dose scenario", frameon=True)
+saved_figures.append(save_current_figure("fig3_channeling_index_timeline"))
+
+# Figure 4: Specific channel probability vs dose
+plt.figure(figsize=(10, 7))
+sns.barplot(
+    data=scenario_summary,
+    x="scenario",
+    y="mean_specific_channel_probability",
+    palette="viridis"
+)
+plt.title("Specific Resistant Pathway Probability by Dose Scenario")
+plt.xlabel("Dose scenario")
+plt.ylabel("Mean specific-channel probability")
+plt.xticks(rotation=25, ha="right")
+saved_figures.append(save_current_figure("fig4_specific_channel_probability"))
+
+# Figure 5: final surviving cells
+plt.figure(figsize=(10, 7))
+sns.barplot(
+    data=scenario_summary,
+    x="scenario",
+    y="median_final_surviving_cells",
+    palette="mako"
+)
+plt.title("Final Surviving Tumor Cells by Dose Scenario")
+plt.xlabel("Dose scenario")
+plt.ylabel("Median final surviving cells")
+plt.xticks(rotation=25, ha="right")
+saved_figures.append(save_current_figure("fig5_final_surviving_cells"))
+
+# Figure 6: biophysical phase plot
+plt.figure(figsize=(10, 7))
+scatter = sns.scatterplot(
+    data=timeline_summary,
+    x="mean_T_eff",
+    y="mean_channeling_index",
+    hue="scenario",
+    size="mean_path_entropy",
+    sizes=(40, 250),
+    alpha=0.82
+)
+plt.title(r"Biophysical Phase Map: $T_{eff}$ vs Channeling")
+plt.xlabel(r"Mean $T_{eff}$")
+plt.ylabel("Mean Channeling Index")
+plt.legend(title="Scenario / Entropy", frameon=True, bbox_to_anchor=(1.02, 1), loc="upper left")
+saved_figures.append(save_current_figure("fig6_Teff_channeling_phase_map"))
+
+# Figure 7: heatmap of main hypothesis metrics
+heatmap_df = scenario_summary.set_index("scenario")[
+    [
+        "mean_T_eff",
+        "mean_path_entropy",
+        "mean_channeling_index",
+        "mean_specific_channel_probability",
+        "probability_specific_variant_emerged",
+        "probability_specific_fixation",
+    ]
+].copy()
+
+# Normalize columns for visual comparison
+heatmap_norm = heatmap_df.copy()
+for col in heatmap_norm.columns:
+    col_min = heatmap_norm[col].min()
+    col_max = heatmap_norm[col].max()
+    if col_max > col_min:
+        heatmap_norm[col] = (heatmap_norm[col] - col_min) / (col_max - col_min)
+    else:
+        heatmap_norm[col] = 0.0
+
+plt.figure(figsize=(12, 7))
+sns.heatmap(
+    heatmap_norm,
+    annot=heatmap_df.round(3),
+    fmt="",
+    cmap="rocket_r",
+    linewidths=0.8,
+    cbar_kws={"label": "Column-normalized intensity"}
+)
+plt.title("Hypothesis Verification Metrics Across Dose Scenarios")
+plt.xlabel("Metric")
+plt.ylabel("Dose scenario")
+saved_figures.append(save_current_figure("fig7_hypothesis_metrics_heatmap"))
+
+# ============================================================
+# 8. Interpretation report
+# ============================================================
+
+interpretation_lines = []
+interpretation_lines.append("# Biophysical Thermodynamic Resistance Simulation Report")
+interpretation_lines.append("")
+interpretation_lines.append("## Core Model")
+interpretation_lines.append("- Dose increases replication stress and oxidative stress.")
+interpretation_lines.append("- Stress raises effective evolutionary temperature, T_eff.")
+interpretation_lines.append("- T_eff and stress deform a free-energy-like mutation-channel landscape.")
+interpretation_lines.append("- Mutation-channel probabilities are computed using a Boltzmann-like rule: p(path_i) ∝ exp(-F_i / T_eff).")
+interpretation_lines.append("- Path entropy is Shannon entropy across mutation channels.")
+interpretation_lines.append("- Channeling Index is the APOBEC-like specific resistance pathway probability divided by the uniform random expectation.")
+interpretation_lines.append("")
+interpretation_lines.append("## Main Hypothesis Verification Metrics")
+interpretation_lines.append(hypothesis_metrics.to_markdown(index=False))
+interpretation_lines.append("")
+interpretation_lines.append("## Output Files")
+interpretation_lines.append("| Output | Purpose | Hypothesis interpretation |")
+interpretation_lines.append("|---|---|---|")
+interpretation_lines.append("| self_contained_model_inputs.json | Synthetic input generator record | Confirms that no external data were loaded. |")
+interpretation_lines.append("| run_level_summary_compact.csv | Replicate-level compact results | Quantifies stochastic variation without storing cell-level raw data. |")
+interpretation_lines.append("| scenario_summary_metrics.csv | Dose-level final summary | Tests whether higher dose increases T_eff, entropy, resistant emergence, and channeling. |")
+interpretation_lines.append("| timeline_path_entropy_Teff_channeling.csv | Aggregated time-course metrics | Tests temporal coupling among dose, T_eff, path entropy, and channeling. |")
+interpretation_lines.append("| hypothesis_verification_metrics.csv | Minimal hypothesis table | Primary table for manuscript Results section. |")
+interpretation_lines.append("| fig1_Teff_timeline.png/pdf | T_eff over time | Supports Hypothesis 1 if higher-dose scenarios show higher T_eff. |")
+interpretation_lines.append("| fig2_path_entropy_timeline.png/pdf | Path entropy over time | Supports Hypothesis 1 if T_eff elevation is accompanied by increased path entropy. |")
+interpretation_lines.append("| fig3_channeling_index_timeline.png/pdf | Specific variant channeling over time | Supports Hypothesis 4 if high dose drives Channeling Index above 1. |")
+interpretation_lines.append("| fig4_specific_channel_probability.png/pdf | Specific pathway probability | Supports Hypothesis 4 if APOBEC-like pathway probability increases with dose/stress. |")
+interpretation_lines.append("| fig5_final_surviving_cells.png/pdf | Final surviving tumor cells | Connects thermodynamic pathway effects to tumor population outcome. |")
+interpretation_lines.append("| fig6_Teff_channeling_phase_map.png/pdf | T_eff-channeling phase map | Shows whether high T_eff states occupy a high-channeling regime. |")
+interpretation_lines.append("| fig7_hypothesis_metrics_heatmap.png/pdf | Integrated metrics heatmap | Provides a compact manuscript figure for both hypotheses. |")
+interpretation_lines.append("")
+interpretation_lines.append("## Manuscript Hypotheses")
+interpretation_lines.append("1. Therapy-Induced Evolutionary Temperature Hypothesis: Higher treatment dose increases replication and oxidative stress, raising effective evolutionary temperature and thereby increasing stochastic mutational exploration.")
+interpretation_lines.append("2. Path Entropy Hypothesis: Higher effective evolutionary temperature increases Shannon path entropy across mutation channels, reflecting broader mutational pathway diversity.")
+interpretation_lines.append("3. Specific Variant Channeling Hypothesis: Treatment stress does not merely increase random mutation noise; it deforms the free-energy landscape and enriches the APOBEC-like specific resistant pathway beyond the uniform random expectation.")
+interpretation_lines.append("4. Biophysical Resistance Coupling Hypothesis: The combination of high T_eff, elevated path entropy, and Channeling Index > 1 predicts increased emergence and fixation probability of a specific resistant clone.")
+
+report_path = os.path.join(OUTPUT_DIR, "biophysical_thermodynamic_interpretation_report.md")
+with open(report_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(interpretation_lines))
+# ============================================================
+# 9. Required final screen output
+# ============================================================
+
+print("\n" + "=" * 90)
+print("STOCHASTIC SIMULATION COMPLETE")
+print("=" * 90)
+print(f"Output directory: {OUTPUT_DIR}")
+print("\n[Primary Summary DataFrame: hypothesis_verification_metrics]")
+print(hypothesis_metrics.to_string(index=False))
+print("\n" + "=" * 90)
+print("MANDATORY OUTPUT LIST AND INTERPRETATION GUIDE")
+print("=" * 90)
+
+output_table = pd.DataFrame([
+    {
+        "Output": "self_contained_model_inputs.json",
+        "Type": "Input record",
+        "Interpretation": "Documents internally generated synthetic population, dose scenarios, and free-energy parameters."
+    },
+    {
+        "Output": "run_level_summary_compact.csv",
+        "Type": "CSV",
+        "Interpretation": "Replicate-level compact metrics; use for uncertainty and stochastic variation."
+    },
+    {
+        "Output": "scenario_summary_metrics.csv",
+        "Type": "CSV",
+        "Interpretation": "Dose-level summary; compare final surviving cells, mean T_eff, entropy, and channeling."
+    },
+    {
+        "Output": "timeline_path_entropy_Teff_channeling.csv",
+        "Type": "CSV",
+        "Interpretation": "Time-resolved aggregated metrics; use to test temporal order: dose → stress → T_eff → entropy/channeling."
+    },
+    {
+        "Output": "hypothesis_verification_metrics.csv",
+        "Type": "CSV",
+        "Interpretation": "Primary manuscript table for Hypothesis 1 and Hypothesis 4."
+    },
+    {
+        "Output": "fig1_Teff_timeline.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Hypothesis 1 is supported if higher-dose scenarios show higher T_eff."
+    },
+    {
+        "Output": "fig2_path_entropy_timeline.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Hypothesis 1 is supported if path entropy increases with T_eff and dose."
+    },
+    {
+        "Output": "fig3_channeling_index_timeline.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Hypothesis 4 is supported if Channeling Index exceeds 1 under high stress."
+    },
+    {
+        "Output": "fig4_specific_channel_probability.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Hypothesis 4 is supported if APOBEC-like specific pathway probability rises with dose."
+    },
+    {
+        "Output": "fig5_final_surviving_cells.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Links biophysical mutation dynamics to tumor population survival."
+    },
+    {
+        "Output": "fig6_Teff_channeling_phase_map.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Shows whether high-T_eff states occupy a high-channeling regime."
+    },
+    {
+        "Output": "fig7_hypothesis_metrics_heatmap.png/pdf",
+        "Type": "Figure",
+        "Interpretation": "Integrated overview of T_eff, entropy, channeling, emergence, and fixation."
+    },
+    {
+        "Output": "biophysical_thermodynamic_interpretation_report.md",
+        "Type": "Markdown report",
+        "Interpretation": "Ready-to-use interpretation guide for manuscript Results and Discussion."
+    },
+])
+
+print(output_table.to_markdown(index=False))
+print("\n" + "=" * 90)
+print("BIOPHYSICAL AND BIOLOGICAL INTERPRETATION")
+print("=" * 90)
+print(
+    "Hypothesis 1 interpretation: If dose escalation increases mean_T_eff and mean_path_entropy, "
+    "the simulation supports the idea that therapy-induced replication/oxidative stress raises "
+    "effective evolutionary temperature and broadens mutational pathway exploration."
+)
+print(
+    "Hypothesis 4 interpretation: If mean_channeling_index > 1 and specific_channel_probability "
+    "increases under high-dose or pulsed-high-dose scenarios, the simulation supports specific "
+    "variant channeling beyond uniform random mutational noise."
+)
+print(
+    "Physical interpretation: The model treats resistant mutation channels as states on a "
+    "dose-deformed free-energy landscape. T_eff controls stochastic exploration, while stress-dependent "
+    "free-energy lowering enriches the APOBEC-like specific resistance path."
+)
+print(
+    "Biological interpretation: Replication stress and oxidative stress increase occupancy of the "
+    "mutagenic repair state, increasing mutation production and biasing variant output toward "
+    "stress-coupled resistant channels."
+)
+print("\n" + "=" * 90)
+print("FILES SAVED")
+print("=" * 90)
+
+for path in [
+    os.path.join(OUTPUT_DIR, "self_contained_model_inputs.json"),
+    run_level_summary_path,
+    scenario_summary_path,
+    timeline_summary_path,
+    hypothesis_metrics_path,
+    report_path,
+]:
+    print(path)
+
+for fig_pair in saved_figures:
+    for fig_path in fig_pair:
+        print(fig_path)
+
+print("\n" + "=" * 90)
+print("MANUSCRIPT HYPOTHESES TO TEST")
+print("=" * 90)
+print("H1. Therapy-Induced Evolutionary Temperature: Higher dose raises replication/oxidative stress and increases T_eff.")
+print("H2. Path Entropy Expansion: Higher T_eff increases Shannon path entropy across resistant mutation channels.")
+print("H3. Mutagenic Repair Occupancy: Higher dose increases transition from normal fidelity replication to mutagenic repair.")
+print("H4. Specific Variant Channeling: Stress deforms the free-energy landscape and enriches the APOBEC-like specific resistance pathway beyond random expectation.")
+print("H5. Resistance Outcome Coupling: High T_eff plus high Channeling Index predicts earlier emergence or fixation of the specific resistant clone.")
+print("=" * 90)
