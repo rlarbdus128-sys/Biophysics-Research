@@ -1,828 +1,2223 @@
+!pip install -q pyyaml scipy pandas matplotlib
+# ============================================
+# CREATE PROJECT DIRECTORY STRUCTURE
+# ============================================
+
 import os
-import csv
+from pathlib import Path
+
+project_dir = Path("renyi_work_project")
+output_dir = project_dir / "outputs"
+
+project_dir.mkdir(exist_ok=True)
+output_dir.mkdir(exist_ok=True)
+
+print("Project directories created.")
+
+
+# ============================================
+# WRITE requirements.txt
+# ============================================
+
+requirements_text = """numpy
+scipy
+pandas
+matplotlib
+pyyaml
+"""
+
+with open(project_dir / "requirements.txt", "w", encoding="utf-8") as f:
+    f.write(requirements_text)
+
+print("requirements.txt written.")
+
+
+# ============================================
+# WRITE config.yaml
+# ============================================
+
+config_text = """project:
+  name: renyi_work_pilot
+  random_seed: 123
+  output_dir: outputs
+
+model:
+  type: transverse_field_ising
+  boundary_condition: periodic
+  J: 1.0
+
+  L_values:
+    - 6
+    - 8
+    - 10
+
+  h_values:
+    - 0.20
+    - 0.40
+    - 0.60
+    - 0.80
+    - 1.00
+    - 1.20
+    - 1.40
+    - 1.60
+    - 1.80
+    - 2.00
+
+entanglement:
+  subsystem_fraction: 0.5
+
+work_protocol:
+  enabled: true
+  L: 8
+  beta: 2.0
+  h_initial: 0.50
+  h_final: 1.50
+  protocol_time: 1.0
+  n_time_steps: 40
+
+  n_trajectories:
+    - 100
+    - 500
+    - 2000
+    - 10000
+
+plots:
+  dpi: 180
+"""
+
+with open(project_dir / "config.yaml", "w", encoding="utf-8") as f:
+    f.write(config_text)
+
+print("config.yaml written.")
+
+
+# ============================================
+# WRITE CLEAN run_renyi_work_project.py
+# ============================================
+
+python_code = r'''
+import argparse
 import json
 import math
+import os
+import gc
+from pathlib import Path
+
+import yaml
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import eigsh
+from scipy.linalg import eigh
+from scipy.linalg import expm
+
+
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
 def ensure_dir(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+    Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def write_default_inputs(input_dir):
-    ensure_dir(input_dir)
-
-    config = {
-        "n_boundary": 3,
-        "n_hidden": 3,
-        "base_boundary_rate": 1.0,
-        "base_hidden_rate": 1.0,
-        "boundary_affinity": 1.0,
-        "hidden_affinity": 2.0,
-        "epsilon": 1.0e-12
-    }
-
-    config_path = os.path.join(input_dir, "config.json")
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-    grid_path = os.path.join(input_dir, "parameter_grid.csv")
-
-    couplings = np.linspace(0.0, 3.0, 16)
-    decoherences = np.linspace(0.0, 2.0, 11)
-
-    with open(grid_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = ("coupling", "decoherence_strength")
-
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for coupling in couplings:
-            for decoherence_strength in decoherences:
-                writer.writerow(
-                    {
-                        "coupling": float(coupling),
-                        "decoherence_strength": float(decoherence_strength)
-                    }
-                )
-
-    return config_path, grid_path
+def spin_z_value(state, site):
+    bit = (state >> site) & 1
+    return 1.0 if bit == 1 else -1.0
 
 
-def load_config(input_dir):
-    config_path = os.path.join(input_dir, "config.json")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_parameter_grid(input_dir):
-    grid_path = os.path.join(input_dir, "parameter_grid.csv")
+def tfim_hamiltonian_sparse(L, J, h, periodic=True):
+    dim = 2 ** L
 
     rows = []
+    cols = []
+    data = []
 
-    with open(grid_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+    for state in range(dim):
 
-        for row in reader:
-            rows.append(
-                {
-                    "coupling": float(row["coupling"]),
-                    "decoherence_strength": float(row["decoherence_strength"])
-                }
-            )
+        diagonal = 0.0
 
-    return rows
+        for site in range(L):
 
+            next_site = site + 1
 
-def make_states(n_boundary, n_hidden):
-    return [
-        (b, h)
-        for b in range(n_boundary)
-        for h in range(n_hidden)
-    ]
-
-
-def make_state_index(states):
-    return {
-        state: index
-        for index, state in enumerate(states)
-    }
-
-
-def build_rates(config, coupling, decoherence_strength):
-    n_boundary = int(config["n_boundary"])
-    n_hidden = int(config["n_hidden"])
-
-    base_boundary_rate = float(config["base_boundary_rate"])
-    base_hidden_rate = float(config["base_hidden_rate"])
-
-    boundary_affinity = float(config["boundary_affinity"])
-    hidden_affinity = float(config["hidden_affinity"])
-
-    states = make_states(n_boundary, n_hidden)
-    state_index = make_state_index(states)
-
-    visibility = 1.0 - math.exp(-decoherence_strength)
-
-    rates = {}
-
-    for source_state in states:
-        b, h = source_state
-
-        source_index = state_index[source_state]
-
-        hidden_angle = 2.0 * math.pi * float(h) / float(n_hidden)
-        boundary_angle = 2.0 * math.pi * float(b) / float(n_boundary)
-
-        hidden_signal = math.cos(hidden_angle)
-        boundary_signal = math.sin(boundary_angle)
-
-        local_boundary_affinity = (
-            boundary_affinity
-            + coupling * visibility * hidden_signal
-        )
-
-        local_hidden_affinity = (
-            hidden_affinity
-            + 0.5 * coupling * boundary_signal
-        )
-
-        b_plus = (b + 1) % n_boundary
-        b_minus = (b - 1) % n_boundary
-
-        h_plus = (h + 1) % n_hidden
-        h_minus = (h - 1) % n_hidden
-
-        dest_boundary_plus = (b_plus, h)
-        dest_boundary_minus = (b_minus, h)
-
-        dest_hidden_plus = (b, h_plus)
-        dest_hidden_minus = (b, h_minus)
-
-        rate_boundary_plus = (
-            base_boundary_rate
-            * math.exp(0.5 * local_boundary_affinity)
-        )
-
-        rate_boundary_minus = (
-            base_boundary_rate
-            * math.exp(-0.5 * local_boundary_affinity)
-        )
-
-        rate_hidden_plus = (
-            base_hidden_rate
-            * math.exp(0.5 * local_hidden_affinity)
-        )
-
-        rate_hidden_minus = (
-            base_hidden_rate
-            * math.exp(-0.5 * local_hidden_affinity)
-        )
-
-        rates[(source_index, state_index[dest_boundary_plus])] = rate_boundary_plus
-        rates[(source_index, state_index[dest_boundary_minus])] = rate_boundary_minus
-        rates[(source_index, state_index[dest_hidden_plus])] = rate_hidden_plus
-        rates[(source_index, state_index[dest_hidden_minus])] = rate_hidden_minus
-
-    return states, rates
-
-
-def build_generator(states, rates):
-    n_states = len(states)
-
-    q_matrix = np.zeros((n_states, n_states), dtype=float)
-
-    for (i, j), rate in rates.items():
-        q_matrix[i, j] = rate
-
-    for i in range(n_states):
-        q_matrix[i, i] = -np.sum(q_matrix[i, :])
-
-    return q_matrix
-
-
-def stationary_distribution(q_matrix):
-    n_states = q_matrix.shape[0]
-
-    a_matrix = q_matrix.T.copy()
-    a_matrix[-1, :] = 1.0
-
-    b_vector = np.zeros(n_states, dtype=float)
-    b_vector[-1] = 1.0
-
-    p = np.linalg.solve(a_matrix, b_vector)
-
-    p = np.maximum(p, 0.0)
-    p = p / np.sum(p)
-
-    return p
-
-
-def entropy_production_from_rates(
-    probabilities,
-    rates,
-    n_states,
-    epsilon
-):
-    entropy_production = 0.0
-
-    for i in range(n_states):
-        for j in range(i + 1, n_states):
-
-            kij = rates.get((i, j), 0.0)
-            kji = rates.get((j, i), 0.0)
-
-            forward_flux = probabilities[i] * kij
-            backward_flux = probabilities[j] * kji
-
-            if (
-                forward_flux > epsilon
-                and backward_flux > epsilon
-            ):
-                current = forward_flux - backward_flux
-                force = math.log(forward_flux / backward_flux)
-
-                entropy_production += current * force
-
-    return float(entropy_production)
-
-
-def aggregate_boundary_rates(
-    states,
-    rates,
-    probabilities,
-    n_boundary,
-    epsilon
-):
-    n_states = len(states)
-
-    boundary_probabilities = np.zeros(n_boundary, dtype=float)
-
-    for index, state in enumerate(states):
-        b, _ = state
-        boundary_probabilities[b] += probabilities[index]
-
-    boundary_rates = {}
-
-    for b in range(n_boundary):
-        for bp in range(n_boundary):
-
-            if b == bp:
-                continue
-
-            flux = 0.0
-
-            for i in range(n_states):
-                source_state = states[i]
-
-                if source_state[0] != b:
+            if next_site == L:
+                if periodic:
+                    next_site = 0
+                else:
                     continue
 
-                for j in range(n_states):
-                    dest_state = states[j]
+            zi = spin_z_value(state, site)
+            zj = spin_z_value(state, next_site)
 
-                    if dest_state[0] == bp:
-                        flux += (
-                            probabilities[i]
-                            * rates.get((i, j), 0.0)
-                        )
+            diagonal -= J * zi * zj
 
-            denominator = boundary_probabilities[b]
+        rows.append(state)
+        cols.append(state)
+        data.append(diagonal)
 
-            if denominator > epsilon:
-                boundary_rates[(b, bp)] = flux / denominator
-            else:
-                boundary_rates[(b, bp)] = 0.0
+        for site in range(L):
+            flipped = state ^ (1 << site)
 
-    boundary_probabilities = (
-        boundary_probabilities
-        / np.sum(boundary_probabilities)
+            rows.append(flipped)
+            cols.append(state)
+            data.append(-h)
+
+    return coo_matrix(
+        (data, (rows, cols)),
+        shape=(dim, dim)
+    ).tocsr()
+
+
+def tfim_hamiltonian_dense(L, J, h, periodic=True):
+    return tfim_hamiltonian_sparse(
+        L, J, h, periodic
+    ).toarray()
+
+
+def ground_state_sparse(H):
+
+    values, vectors = eigsh(H, k=1, which="SA")
+
+    energy = float(values[0])
+
+    vector = vectors[:, 0]
+    vector = vector / np.linalg.norm(vector)
+
+    return energy, vector
+
+
+def renyi2_entropy_contiguous_subsystem(psi, L, LA):
+
+    dimA = 2 ** LA
+    dimB = 2 ** (L - LA)
+
+    matrix = psi.reshape((dimA, dimB))
+
+    rhoA = matrix @ np.conjugate(matrix).T
+
+    purity = np.real(np.trace(rhoA @ rhoA))
+
+    if purity <= 0:
+        return float("nan"), float(purity)
+
+    S2 = -math.log(float(purity))
+
+    return float(S2), float(purity)
+
+
+def von_neumann_entropy_contiguous_subsystem(psi, L, LA):
+
+    dimA = 2 ** LA
+    dimB = 2 ** (L - LA)
+
+    matrix = psi.reshape((dimA, dimB))
+
+    rhoA = matrix @ np.conjugate(matrix).T
+
+    evals = np.linalg.eigvalsh(rhoA)
+    evals = np.real(evals)
+    evals = np.maximum(evals, 0.0)
+
+    entropy = 0.0
+
+    for value in evals:
+        if value > 1.0e-14:
+            entropy -= float(value) * math.log(float(value))
+
+    return float(entropy)
+
+
+def compute_entanglement_scan(cfg):
+
+    model = cfg["model"]
+    ent = cfg["entanglement"]
+
+    L_values = model["L_values"]
+    h_values = model["h_values"]
+
+    J = float(model["J"])
+
+    periodic = (
+        model["boundary_condition"] == "periodic"
     )
 
-    return boundary_probabilities, boundary_rates
+    frac = float(ent["subsystem_fraction"])
 
+    records = []
 
-def entropy_of_distribution(probabilities, epsilon):
-    total = 0.0
+    for L in L_values:
 
-    for probability in probabilities:
-        if probability > epsilon:
-            total -= probability * math.log(probability)
+        LA = int(round(frac * L))
 
-    return float(total)
+        if LA < 1:
+            LA = 1
 
+        if LA >= L:
+            LA = L // 2
 
-def information_measures(
-    states,
-    probabilities,
-    n_boundary,
-    n_hidden,
-    epsilon
-):
-    p_boundary = np.zeros(n_boundary, dtype=float)
-    p_hidden = np.zeros(n_hidden, dtype=float)
+        for h in h_values:
 
-    for index, state in enumerate(states):
-        b, h = state
+            print(f"Entanglement scan: L={L}, h={h}")
 
-        p_boundary[b] += probabilities[index]
-        p_hidden[h] += probabilities[index]
+            H = tfim_hamiltonian_sparse(
+                L, J, float(h), periodic
+            )
 
-    p_joint = probabilities.copy()
+            energy, psi0 = ground_state_sparse(H)
 
-    h_boundary = entropy_of_distribution(p_boundary, epsilon)
-    h_hidden = entropy_of_distribution(p_hidden, epsilon)
-    h_joint = entropy_of_distribution(p_joint, epsilon)
+            S2, purity = (
+                renyi2_entropy_contiguous_subsystem(
+                    psi0, L, LA
+                )
+            )
 
-    mutual_information = (
-        h_boundary
-        + h_hidden
-        - h_joint
-    )
+            SvN = (
+                von_neumann_entropy_contiguous_subsystem(
+                    psi0, L, LA
+                )
+            )
 
-    conditional_hidden_entropy = (
-        h_joint
-        - h_boundary
-    )
-
-    return {
-        "h_boundary": h_boundary,
-        "h_hidden": h_hidden,
-        "h_joint": h_joint,
-        "mutual_information": mutual_information,
-        "conditional_hidden_entropy": conditional_hidden_entropy
-    }
-
-
-def run_single_model(
-    config,
-    coupling,
-    decoherence_strength
-):
-    epsilon = float(config["epsilon"])
-
-    n_boundary = int(config["n_boundary"])
-    n_hidden = int(config["n_hidden"])
-
-    states, rates = build_rates(
-        config,
-        coupling,
-        decoherence_strength
-    )
-
-    q_matrix = build_generator(states, rates)
-
-    stationary = stationary_distribution(q_matrix)
-
-    full_ep = entropy_production_from_rates(
-        stationary,
-        rates,
-        len(states),
-        epsilon
-    )
-
-    boundary_probabilities, boundary_rates = aggregate_boundary_rates(
-        states,
-        rates,
-        stationary,
-        n_boundary,
-        epsilon
-    )
-
-    boundary_ep = entropy_production_from_rates(
-        boundary_probabilities,
-        boundary_rates,
-        n_boundary,
-        epsilon
-    )
-
-    hidden_gap = full_ep - boundary_ep
-
-    info = information_measures(
-        states,
-        stationary,
-        n_boundary,
-        n_hidden,
-        epsilon
-    )
-
-    reflection_ratio = 0.0
-
-    if full_ep > epsilon:
-        reflection_ratio = boundary_ep / full_ep
-
-    result = {
-        "coupling": coupling,
-        "decoherence_strength": decoherence_strength,
-        "full_ep": full_ep,
-        "boundary_ep": boundary_ep,
-        "hidden_gap": hidden_gap,
-        "reflection_ratio": reflection_ratio,
-        "mutual_information": info["mutual_information"],
-        "conditional_hidden_entropy": info["conditional_hidden_entropy"],
-        "h_boundary": info["h_boundary"],
-        "h_hidden": info["h_hidden"],
-        "h_joint": info["h_joint"]
-    }
-
-    return result, states, rates, stationary
-
-
-def write_example_rates(output_path, states, rates):
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-
-        fieldnames = (
-            "source_index",
-            "source_boundary",
-            "source_hidden",
-            "dest_index",
-            "dest_boundary",
-            "dest_hidden",
-            "rate"
-        )
-
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-        writer.writeheader()
-
-        for key, rate in rates.items():
-            source_index, dest_index = key
-
-            source_state = states[source_index]
-            dest_state = states[dest_index]
-
-            writer.writerow(
+            records.append(
                 {
-                    "source_index": source_index,
-                    "source_boundary": source_state[0],
-                    "source_hidden": source_state[1],
-                    "dest_index": dest_index,
-                    "dest_boundary": dest_state[0],
-                    "dest_hidden": dest_state[1],
-                    "rate": rate
+                    "L": int(L),
+                    "LA": int(LA),
+                    "h": float(h),
+                    "ground_energy": float(energy),
+                    "ground_energy_per_site":
+                        float(energy) / float(L),
+                    "S2_half": float(S2),
+                    "purity_half": float(purity),
+                    "SvN_half": float(SvN),
                 }
             )
 
+            del H
+            gc.collect()
 
-def write_results_csv(output_dir, results):
-    path = os.path.join(output_dir, "results_summary.csv")
+    return pd.DataFrame.from_records(records)
 
-    fieldnames = (
-        "coupling",
-        "decoherence_strength",
-        "full_ep",
-        "boundary_ep",
-        "hidden_gap",
-        "reflection_ratio",
-        "mutual_information",
-        "conditional_hidden_entropy",
-        "h_boundary",
-        "h_hidden",
-        "h_joint"
+
+def thermal_free_energy_from_dense_hamiltonian(H, beta):
+
+    evals = eigh(H, eigvals_only=True)
+
+    emin = float(np.min(evals))
+
+    shifted = np.exp(
+        -beta * (evals - emin)
     )
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-        writer.writeheader()
-
-        for row in results:
-            writer.writerow(row)
-
-    return path
-
-
-def correlation(x_values, y_values):
-    n = len(x_values)
-
-    if n < 2:
-        return 0.0
-
-    mean_x = sum(x_values) / float(n)
-    mean_y = sum(y_values) / float(n)
-
-    covariance = sum(
-        (x - mean_x) * (y - mean_y)
-        for x, y in zip(x_values, y_values)
+    logZ = (
+        -beta * emin
+        + math.log(float(np.sum(shifted)))
     )
 
-    variance_x = sum(
-        (x - mean_x) * (x - mean_x)
-        for x in x_values
-    )
+    F = -logZ / beta
 
-    variance_y = sum(
-        (y - mean_y) * (y - mean_y)
-        for y in y_values
-    )
-
-    denominator = math.sqrt(
-        variance_x * variance_y
-    )
-
-    if denominator <= 0.0:
-        return 0.0
-
-    return covariance / denominator
+    return float(F), evals
 
 
-def make_heatmap(
-    results,
-    output_dir,
-    metric_name,
-    file_name,
-    title
+def build_unitary_linear_h_protocol(
+    L,
+    J,
+    h_initial,
+    h_final,
+    total_time,
+    n_steps,
+    periodic
 ):
-    couplings = sorted(
-        list(
-            set(
-                row["coupling"]
-                for row in results
-            )
+
+    dim = 2 ** L
+
+    U = np.eye(dim, dtype=complex)
+
+    dt = total_time / float(n_steps)
+
+    for step in range(n_steps):
+
+        frac = (
+            (float(step) + 0.5)
+            / float(n_steps)
+        )
+
+        h = (
+            h_initial
+            + frac * (h_final - h_initial)
+        )
+
+        H = tfim_hamiltonian_dense(
+            L, J, h, periodic
+        )
+
+        U_step = expm((-1.0j * dt) * H)
+
+        U = U_step @ U
+
+        del H
+        del U_step
+
+        gc.collect()
+
+    return U
+
+
+def jarzynski_projective_work_protocol(cfg):
+
+    model = cfg["model"]
+    work = cfg["work_protocol"]
+
+    seed = int(cfg["project"]["random_seed"])
+
+    rng = np.random.default_rng(seed)
+
+    L = int(work["L"])
+    beta = float(work["beta"])
+
+    h_initial = float(work["h_initial"])
+    h_final = float(work["h_final"])
+
+    protocol_time = float(
+        work["protocol_time"]
+    )
+
+    n_time_steps = int(
+        work["n_time_steps"]
+    )
+
+    n_trajectory_values = (
+        work["n_trajectories"]
+    )
+
+    J = float(model["J"])
+
+    periodic = (
+        model["boundary_condition"] == "periodic"
+    )
+
+    print("Building dense Hamiltonians...")
+
+    H0 = tfim_hamiltonian_dense(
+        L, J, h_initial, periodic
+    )
+
+    H1 = tfim_hamiltonian_dense(
+        L, J, h_final, periodic
+    )
+
+    F0, _ = thermal_free_energy_from_dense_hamiltonian(
+        H0, beta
+    )
+
+    F1, _ = thermal_free_energy_from_dense_hamiltonian(
+        H1, beta
+    )
+
+    exact_delta_F = F1 - F0
+
+    evals0, evecs0 = eigh(H0)
+    evals1, evecs1 = eigh(H1)
+
+    shifted = np.exp(
+        -beta * (
+            evals0 - np.min(evals0)
         )
     )
 
-    decoherences = sorted(
-        list(
-            set(
-                row["decoherence_strength"]
-                for row in results
-            )
-        )
+    probs0 = shifted / np.sum(shifted)
+
+    print("Building protocol unitary...")
+
+    U = build_unitary_linear_h_protocol(
+        L,
+        J,
+        h_initial,
+        h_final,
+        protocol_time,
+        n_time_steps,
+        periodic,
     )
 
-    z_matrix = np.zeros(
-        (len(decoherences), len(couplings)),
+    max_trajectories = int(
+        max(n_trajectory_values)
+    )
+
+    raw_records = []
+    work_values = []
+
+    dim = 2 ** L
+
+    print("Running trajectories...")
+
+    for traj in range(max_trajectories):
+
+        if traj % 1000 == 0:
+            print(f"Trajectory {traj}")
+
+        n = int(
+            rng.choice(dim, p=probs0)
+        )
+
+        initial_vec = evecs0[:, n]
+
+        evolved = U @ initial_vec
+
+        amplitudes = (
+            np.conjugate(evecs1).T @ evolved
+        )
+
+        probs_final = np.abs(amplitudes) ** 2
+
+        probs_final = (
+            probs_final
+            / np.sum(probs_final)
+        )
+
+        m = int(
+            rng.choice(dim, p=probs_final)
+        )
+
+        Ei = float(evals0[n])
+        Ef = float(evals1[m])
+
+        W = Ef - Ei
+
+        work_values.append(W)
+
+        raw_records.append(
+            {
+                "trajectory": int(traj),
+                "initial_index": int(n),
+                "final_index": int(m),
+                "E_initial": float(Ei),
+                "E_final": float(Ef),
+                "work": float(W),
+            }
+        )
+
+    work_array = np.array(
+        work_values,
         dtype=float
     )
 
-    for i, decoherence_strength in enumerate(decoherences):
-        for j, coupling in enumerate(couplings):
+    summary_records = []
 
-            for row in results:
-                if (
-                    abs(row["coupling"] - coupling) < 1.0e-12
-                    and abs(
-                        row["decoherence_strength"]
-                        - decoherence_strength
-                    ) < 1.0e-12
-                ):
-                    z_matrix[i, j] = row[metric_name]
-                    break
+    for ntraj in n_trajectory_values:
 
-    fig, ax = plt.subplots(figsize=(7.0, 5.0))
+        ntraj = int(ntraj)
 
-    image = ax.imshow(
-        z_matrix,
-        origin="lower",
-        aspect="auto",
-        extent=(
-            min(couplings),
-            max(couplings),
-            min(decoherences),
-            max(decoherences)
+        subset = work_array[:ntraj]
+
+        exp_average = float(
+            np.mean(np.exp(-beta * subset))
         )
+
+        jarzynski_delta_F = (
+            -math.log(exp_average)
+            / beta
+        )
+
+        mean_work = float(np.mean(subset))
+
+        dissipated_work = (
+            mean_work - exact_delta_F
+        )
+
+        error = (
+            jarzynski_delta_F
+            - exact_delta_F
+        )
+
+        summary_records.append(
+            {
+                "L": int(L),
+                "beta": float(beta),
+                "h_initial": float(h_initial),
+                "h_final": float(h_final),
+                "protocol_time":
+                    float(protocol_time),
+                "n_time_steps":
+                    int(n_time_steps),
+                "n_trajectories":
+                    int(ntraj),
+                "exact_delta_F":
+                    float(exact_delta_F),
+                "jarzynski_delta_F":
+                    float(jarzynski_delta_F),
+                "jarzynski_error":
+                    float(error),
+                "mean_work":
+                    float(mean_work),
+                "dissipated_work_estimate":
+                    float(dissipated_work),
+            }
+        )
+
+    raw_df = pd.DataFrame.from_records(
+        raw_records
     )
 
-    ax.set_xlabel("coupling")
-    ax.set_ylabel("decoherence strength")
-    ax.set_title(title)
+    summary_df = pd.DataFrame.from_records(
+        summary_records
+    )
 
-    fig.colorbar(image, ax=ax)
-
-    fig.tight_layout()
-
-    path = os.path.join(output_dir, file_name)
-
-    fig.savefig(path, dpi=200)
-
-    plt.close(fig)
-
-    return path
+    return raw_df, summary_df
 
 
-def make_scatter(
-    results,
-    output_dir,
-    x_metric,
-    y_metric,
-    file_name,
-    title
+def compute_bridge_statistics(
+    entropy_df,
+    work_summary_df
 ):
-    x_values = [
-        row[x_metric]
-        for row in results
-    ]
 
-    y_values = [
-        row[y_metric]
-        for row in results
-    ]
+    records = []
 
-    corr_value = correlation(
-        x_values,
-        y_values
+    for L, sub in entropy_df.groupby("L"):
+
+        h_values = sub["h"].to_numpy()
+
+        S2_values = (
+            sub["S2_half"].to_numpy()
+        )
+
+        energy_values = (
+            sub["ground_energy_per_site"]
+            .to_numpy()
+        )
+
+        if len(h_values) > 1:
+
+            corr_S2_h = float(
+                np.corrcoef(
+                    h_values,
+                    S2_values
+                )[0, 1]
+            )
+
+            corr_S2_energy = float(
+                np.corrcoef(
+                    energy_values,
+                    S2_values
+                )[0, 1]
+            )
+
+        else:
+
+            corr_S2_h = float("nan")
+            corr_S2_energy = float("nan")
+
+        records.append(
+            {
+                "L": int(L),
+                "corr_S2_with_h":
+                    float(corr_S2_h),
+                "corr_S2_with_energy_per_site":
+                    float(corr_S2_energy),
+                "S2_min":
+                    float(np.min(S2_values)),
+                "S2_max":
+                    float(np.max(S2_values)),
+                "S2_range":
+                    float(
+                        np.max(S2_values)
+                        - np.min(S2_values)
+                    ),
+            }
+        )
+
+    if (
+        work_summary_df is not None
+        and len(work_summary_df) > 0
+    ):
+
+        final_row = (
+            work_summary_df
+            .tail(1)
+            .to_dict(orient="records")[0]
+        )
+
+        for record in records:
+
+            record.update(
+                {
+                    "final_jarzynski_error":
+                        float(
+                            final_row[
+                                "jarzynski_error"
+                            ]
+                        ),
+                    "final_dissipated_work_estimate":
+                        float(
+                            final_row[
+                                "dissipated_work_estimate"
+                            ]
+                        ),
+                }
+            )
+
+    return pd.DataFrame.from_records(records)
+
+
+def plot_entropy_vs_h(
+    entropy_df,
+    output_dir,
+    dpi
+):
+
+    fig, ax = plt.subplots(
+        figsize=(7, 5)
     )
 
-    fig, ax = plt.subplots(figsize=(6.0, 5.0))
+    for L, sub in entropy_df.groupby("L"):
 
-    ax.scatter(
-        x_values,
-        y_values,
-        s=30.0
+        ax.plot(
+            sub["h"].to_numpy(),
+            sub["S2_half"].to_numpy(),
+            marker="o",
+            label=f"L={L}",
+        )
+
+    ax.set_xlabel(
+        "transverse field h"
     )
 
-    ax.set_xlabel(x_metric)
-    ax.set_ylabel(y_metric)
+    ax.set_ylabel(
+        "half-chain second Renyi entropy S2"
+    )
 
     ax.set_title(
-        title
-        + " corr="
-        + str(round(corr_value, 3))
+        "Half-chain Renyi-2 entanglement entropy"
+    )
+
+    ax.legend()
+
+    ax.grid(True, alpha=0.3)
+
+    path = (
+        Path(output_dir)
+        / "fig_entropy_vs_h.png"
     )
 
     fig.tight_layout()
 
-    path = os.path.join(output_dir, file_name)
-
-    fig.savefig(path, dpi=200)
+    fig.savefig(path, dpi=dpi)
 
     plt.close(fig)
 
-    return path, corr_value
+    gc.collect()
 
 
-def write_readme(
+def plot_purity_vs_h(
+    entropy_df,
     output_dir,
-    corr_hidden_gap,
-    corr_mutual_information
+    dpi
 ):
-    path = os.path.join(
-        output_dir,
-        "README_outputs.txt"
+
+    fig, ax = plt.subplots(
+        figsize=(7, 5)
     )
 
-    text = f"""
-Output files generated by the boundary hidden toy model.
+    for L, sub in entropy_df.groupby("L"):
 
-results_summary.csv:
-Parameter sweep table containing full entropy production, boundary entropy production, hidden gap, reflection ratio, mutual information, and conditional hidden entropy.
+        ax.plot(
+            sub["h"].to_numpy(),
+            sub["purity_half"].to_numpy(),
+            marker="o",
+            label=f"L={L}",
+        )
 
-heatmap_boundary_ep.png:
-Heatmap of boundary observed entropy production.
+    ax.set_xlabel(
+        "transverse field h"
+    )
 
-heatmap_hidden_gap.png:
-Heatmap of full entropy production minus boundary entropy production.
+    ax.set_ylabel(
+        "half-chain purity"
+    )
 
-heatmap_reflection_ratio.png:
-Heatmap of boundary entropy production divided by full entropy production.
+    ax.set_title(
+        "Reduced-state purity"
+    )
 
-scatter_boundary_vs_hidden_gap.png:
-Scatter plot testing whether boundary entropy production reflects hidden entropy production.
+    ax.legend()
 
-scatter_boundary_vs_mutual_information.png:
-Scatter plot testing whether boundary entropy production reflects hidden information structure.
+    ax.grid(True, alpha=0.3)
 
-example_rates.csv:
-Example full transition rate table for one selected parameter set.
+    path = (
+        Path(output_dir)
+        / "fig_purity_vs_h.png"
+    )
 
-Key correlations:
-boundary entropy production versus hidden gap correlation = {round(corr_hidden_gap, 6)}
+    fig.tight_layout()
 
-boundary entropy production versus mutual information correlation = {round(corr_mutual_information, 6)}
+    fig.savefig(path, dpi=dpi)
 
-Interpretation:
-If the first correlation is positive and increases with coupling or decoherence strength, the hypothesis is supported.
+    plt.close(fig)
 
-If the correlation is weak or parameter dependent, the result supports the more cautious conclusion that boundary entropy production is an indirect and limited probe of hidden information structure.
-"""
+    gc.collect()
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
 
-    return path
+def plot_jarzynski_convergence(
+    work_summary_df,
+    output_dir,
+    dpi
+):
+
+    fig, ax = plt.subplots(
+        figsize=(7, 5)
+    )
+
+    ax.axhline(
+        float(
+            work_summary_df[
+                "exact_delta_F"
+            ].iloc[0]
+        ),
+        color="black",
+        linestyle="--",
+        label="exact delta F",
+    )
+
+    ax.plot(
+        work_summary_df[
+            "n_trajectories"
+        ].to_numpy(),
+        work_summary_df[
+            "jarzynski_delta_F"
+        ].to_numpy(),
+        marker="o",
+        label="Jarzynski estimate",
+    )
+
+    ax.set_xscale("log")
+
+    ax.set_xlabel(
+        "number of trajectories"
+    )
+
+    ax.set_ylabel(
+        "free-energy difference"
+    )
+
+    ax.set_title(
+        "Jarzynski estimator convergence"
+    )
+
+    ax.legend()
+
+    ax.grid(True, alpha=0.3)
+
+    path = (
+        Path(output_dir)
+        / "fig_jarzynski_convergence.png"
+    )
+
+    fig.tight_layout()
+
+    fig.savefig(path, dpi=dpi)
+
+    plt.close(fig)
+
+    gc.collect()
+
+
+def plot_work_histogram(
+    work_raw_df,
+    output_dir,
+    dpi
+):
+
+    fig, ax = plt.subplots(
+        figsize=(7, 5)
+    )
+
+    ax.hist(
+        work_raw_df["work"].to_numpy(),
+        bins=60,
+        alpha=0.8,
+    )
+
+    ax.set_xlabel("work W")
+
+    ax.set_ylabel("count")
+
+    ax.set_title(
+        "Projective work distribution"
+    )
+
+    ax.grid(True, alpha=0.3)
+
+    path = (
+        Path(output_dir)
+        / "fig_work_distribution.png"
+    )
+
+    fig.tight_layout()
+
+    fig.savefig(path, dpi=dpi)
+
+    plt.close(fig)
+
+    gc.collect()
+
+
+def save_metadata(cfg, output_dir):
+
+    path = (
+        Path(output_dir)
+        / "study_metadata.json"
+    )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as handle:
+
+        json.dump(
+            cfg,
+            handle,
+            indent=2
+        )
+
+
+def save_reproducibility_log(
+    cfg,
+    output_dir
+):
+
+    path = (
+        Path(output_dir)
+        / "reproducibility_log.txt"
+    )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as handle:
+
+        handle.write(
+            "Project: "
+            + str(cfg["project"]["name"])
+            + os.linesep
+        )
+
+        handle.write(
+            "Random seed: "
+            + str(
+                cfg["project"]["random_seed"]
+            )
+            + os.linesep
+        )
+
+        handle.write(
+            "Model: transverse-field Ising chain"
+            + os.linesep
+        )
+
+        handle.write(
+            "Entanglement measure: half-chain second Renyi entropy"
+            + os.linesep
+        )
+
+        handle.write(
+            "Work protocol: finite-temperature two-projective-measurement Jarzynski estimator"
+            + os.linesep
+        )
 
 
 def main():
-    input_dir = "toy_inputs"
-    output_dir = "toy_outputs"
 
-    ensure_dir(input_dir)
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+    )
+
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+
+    project = cfg["project"]
+
+    plots = cfg["plots"]
+
+    work = cfg["work_protocol"]
+
+    output_dir = (
+        project["output_dir"]
+    )
+
+    dpi = int(plots["dpi"])
+
     ensure_dir(output_dir)
 
-    write_default_inputs(input_dir)
+    save_metadata(
+        cfg,
+        output_dir
+    )
 
-    config = load_config(input_dir)
+    save_reproducibility_log(
+        cfg,
+        output_dir
+    )
 
-    parameter_grid = load_parameter_grid(input_dir)
+    entropy_df = (
+        compute_entanglement_scan(cfg)
+    )
 
-    results = []
+    entropy_path = (
+        Path(output_dir)
+        / "entropy_scan.csv"
+    )
 
-    selected_states = None
-    selected_rates = None
-    selected_stationary = None
+    entropy_df.to_csv(
+        entropy_path,
+        index=False
+    )
 
-    for row in parameter_grid:
-        coupling = row["coupling"]
+    work_raw_df = None
+    work_summary_df = None
 
-        decoherence_strength = row["decoherence_strength"]
+    if bool(work["enabled"]):
 
-        result, states, rates, stationary = run_single_model(
-            config,
-            coupling,
-            decoherence_strength
+        (
+            work_raw_df,
+            work_summary_df,
+        ) = (
+            jarzynski_projective_work_protocol(cfg)
         )
 
-        results.append(result)
+        raw_path = (
+            Path(output_dir)
+            / "work_trajectories.csv"
+        )
 
-        if (
-            abs(coupling - 3.0) < 1.0e-12
-            and abs(decoherence_strength - 2.0) < 1.0e-12
-        ):
-            selected_states = states
-            selected_rates = rates
-            selected_stationary = stationary
+        summary_path = (
+            Path(output_dir)
+            / "jarzynski_summary.csv"
+        )
 
-    write_results_csv(output_dir, results)
+        work_raw_df.to_csv(
+            raw_path,
+            index=False
+        )
 
-    if selected_states is not None:
-        example_rates_path = os.path.join(
+        work_summary_df.to_csv(
+            summary_path,
+            index=False
+        )
+
+    bridge_df = compute_bridge_statistics(
+        entropy_df,
+        work_summary_df
+    )
+
+    bridge_path = (
+        Path(output_dir)
+        / "bridge_statistics.csv"
+    )
+
+    bridge_df.to_csv(
+        bridge_path,
+        index=False
+    )
+
+    plot_entropy_vs_h(
+        entropy_df,
+        output_dir,
+        dpi
+    )
+
+    plot_purity_vs_h(
+        entropy_df,
+        output_dir,
+        dpi
+    )
+
+    if (
+        work_raw_df is not None
+        and work_summary_df is not None
+    ):
+
+        plot_jarzynski_convergence(
+            work_summary_df,
             output_dir,
-            "example_rates.csv"
+            dpi
         )
 
-        write_example_rates(
-            example_rates_path,
-            selected_states,
-            selected_rates
+        plot_work_histogram(
+            work_raw_df,
+            output_dir,
+            dpi
         )
 
-    make_heatmap(
-        results,
-        output_dir,
-        "boundary_ep",
-        "heatmap_boundary_ep.png",
-        "Boundary observed entropy production"
+    print("Finished.")
+    print("Outputs written to:")
+    print(output_dir)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+with open(
+    project_dir / "run_renyi_work_project.py",
+    "w",
+    encoding="utf-8"
+) as f:
+    f.write(python_code)
+
+print("run_renyi_work_project.py written.")
+
+
+# ============================================
+# INSTALL REQUIREMENTS
+# ============================================
+
+print("\nInstalling packages...\n")
+
+os.system(
+    "pip install numpy scipy pandas matplotlib pyyaml"
+)
+
+
+# ============================================
+# RUN PROJECT
+# ============================================
+
+print("\nRunning project...\n")
+
+os.chdir(project_dir)
+
+os.system(
+    "python run_renyi_work_project.py --config config.yaml"
+)
+
+
+# ============================================
+# CREATE ZIP FILE
+# ============================================
+
+import shutil
+
+shutil.make_archive(
+    "renyi_work_outputs",
+    "zip",
+    "outputs"
+)
+
+print("\nZIP archive created:")
+print("renyi_work_outputs.zip")
+
+import numpy as np
+import math
+
+
+def exact_tpm_jarzynski_check(evals0, evecs0, evals1, evecs1, U, beta):
+    boltz0 = np.exp(-beta * evals0)
+    Z0 = float(np.sum(boltz0))
+    Z1 = float(np.sum(np.exp(-beta * evals1)))
+
+    p0 = boltz0 / Z0
+
+    transition = np.abs(evecs1.conj().T @ U @ evecs0) ** 2
+
+    factor = np.outer(
+        np.exp(-beta * evals1),
+        p0 * np.exp(beta * evals0)
     )
 
-    make_heatmap(
-        results,
-        output_dir,
-        "hidden_gap",
-        "heatmap_hidden_gap.png",
-        "Hidden entropy production gap"
+    exp_average_exact = float(np.sum(transition * factor))
+
+    delta_F_exact = -math.log(Z1 / Z0) / beta
+    delta_F_tpm = -math.log(exp_average_exact) / beta
+
+    return {
+        "exp_average_exact_tpm": exp_average_exact,
+        "exp_minus_beta_delta_F": Z1 / Z0,
+        "delta_F_exact": delta_F_exact,
+        "delta_F_tpm": delta_F_tpm,
+        "difference": delta_F_tpm - delta_F_exact
+    }
+
+def unitary_quality(U):
+    dim = U.shape[0]
+    identity = np.eye(dim, dtype=complex)
+    deviation = U.conj().T @ U - identity
+    return float(np.linalg.norm(deviation))
+def bootstrap_jarzynski_delta_F(work_array, beta, n_bootstrap, seed):
+    rng = np.random.default_rng(seed)
+    estimates = []
+
+    sample_size = work_array.size
+
+    for repeat in range(n_bootstrap):
+        sample = rng.choice(
+            work_array,
+            size=sample_size,
+            replace=True
+        )
+
+        exp_average = float(np.mean(np.exp(-beta * sample)))
+        estimate = -math.log(exp_average) / beta
+        estimates.append(estimate)
+
+    low, median, high = np.quantile(
+        np.array(estimates),
+        (0.025, 0.5, 0.975)
     )
 
-    make_heatmap(
-        results,
-        output_dir,
-        "reflection_ratio",
-        "heatmap_reflection_ratio.png",
-        "Boundary EP divided by full EP"
+    return {
+        "jarzynski_bootstrap_low": float(low),
+        "jarzynski_bootstrap_median": float(median),
+        "jarzynski_bootstrap_high": float(high)
+    }
+def work_distribution_diagnostics(work_array, beta):
+    weights = np.exp(-beta * work_array)
+    normalized = weights / np.sum(weights)
+
+    effective_sample_size = 1.0 / float(np.sum(normalized ** 2))
+
+    mean_work = float(np.mean(work_array))
+    variance_work = float(np.var(work_array))
+
+    centered = work_array - mean_work
+    third = float(np.mean(centered ** 3))
+
+    if variance_work > 0.0:
+        skewness = third / float(variance_work ** 1.5)
+    else:
+        skewness = float("nan")
+
+    return {
+        "mean_work": mean_work,
+        "variance_work": variance_work,
+        "skewness_work": skewness,
+        "effective_sample_size": effective_sample_size
+    }
+def entropy_derivative_summary(entropy_df):
+    records = []
+
+    for L_value, sub in entropy_df.groupby("L"):
+        ordered = sub.sort_values("h")
+
+        h_values = ordered.h.to_numpy()
+        S2_values = ordered.S2_half.to_numpy()
+
+        derivative = np.gradient(S2_values, h_values)
+
+        max_position = int(np.argmax(np.abs(derivative)))
+
+        records.append(
+            {
+                "L": int(L_value),
+                "max_abs_dS2_dh": float(np.max(np.abs(derivative))),
+                "h_at_max_abs_dS2_dh": float(np.take(h_values, max_position)),
+                "S2_at_max_abs_dS2_dh": float(np.take(S2_values, max_position))
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+def thermal_density_matrix(H, beta):
+    evals, evecs = eigh(H)
+    weights = np.exp(-beta * evals)
+    weights = weights / np.sum(weights)
+    rho = evecs @ np.diag(weights) @ evecs.conj().T
+    return rho
+
+
+def renyi2_entropy_from_density_matrix(rho, L, LA):
+    dimA = 2 ** LA
+    dimB = 2 ** (L - LA)
+
+    rho_tensor = rho.reshape(dimA, dimB, dimA, dimB)
+
+    rhoA = np.trace(
+        rho_tensor,
+        axis1=1,
+        axis2=3
     )
 
-    _, corr_hidden_gap = make_scatter(
-        results,
-        output_dir,
-        "boundary_ep",
-        "hidden_gap",
-        "scatter_boundary_vs_hidden_gap.png",
-        "Boundary EP versus hidden gap"
+    purity = float(np.real(np.trace(rhoA @ rhoA)))
+
+    if purity <= 0.0:
+        return float("nan"), purity
+
+    entropy = -math.log(purity)
+
+    return float(entropy), purity
+%cd /kaggle/working/renyi_work_project
+from pathlib import Path
+
+# 1. 프로젝트 경로 (이미 존재한다고 가정)
+project_dir = Path("/kaggle/working/renyi_work_project")
+
+# 2. 하위 폴더 생성 (없으면 생성)
+target_dir = project_dir / "renyi_work_project"
+target_dir.mkdir(parents=True, exist_ok=True)
+
+# 3. 생성할 파일 경로
+file_path = target_dir / "postprocess_additional_analyses.py"
+
+# 4. 파일 내용 (그대로 저장)
+code = r'''
+import argparse
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def bootstrap_jarzynski_delta_F_for_subset(
+    work_values,
+    beta,
+    n_bootstrap,
+    seed
+):
+    rng = np.random.default_rng(seed)
+
+    estimates = list()
+    sample_size = work_values.size
+
+    for repeat in range(n_bootstrap):
+        sample = rng.choice(
+            work_values,
+            size=sample_size,
+            replace=True
+        )
+
+        exp_average = float(
+            np.mean(np.exp(-beta * sample))
+        )
+
+        estimate = -math.log(exp_average) / beta
+
+        estimates.append(estimate)
+
+    estimates = np.array(estimates, dtype=float)
+
+    low, median, high = np.quantile(
+        estimates,
+        (0.025, 0.5, 0.975)
     )
 
-    _, corr_mutual_information = make_scatter(
-        results,
-        output_dir,
-        "boundary_ep",
-        "mutual_information",
-        "scatter_boundary_vs_mutual_information.png",
-        "Boundary EP versus mutual information"
-    )
+    return {
+        "jarzynski_bootstrap_low": float(low),
+        "jarzynski_bootstrap_median": float(median),
+        "jarzynski_bootstrap_high": float(high),
+        "jarzynski_bootstrap_width": float(high - low)
+    }
 
-    write_readme(
+
+def add_bootstrap_to_jarzynski_summary(
+    output_dir,
+    n_bootstrap,
+    seed
+):
+    output_dir = Path(output_dir)
+
+    raw_path = output_dir / "work_trajectories.csv"
+    summary_path = output_dir / "jarzynski_summary.csv"
+
+    raw = pd.read_csv(raw_path)
+    summary = pd.read_csv(summary_path)
+
+    work_all = raw.work.to_numpy(dtype=float)
+
+    enriched_records = list()
+
+    for row_index, row in summary.iterrows():
+        ntraj = int(row.n_trajectories)
+        beta = float(row.beta)
+
+        subset = np.take(
+            work_all,
+            np.arange(ntraj)
+        )
+
+        stats = bootstrap_jarzynski_delta_F_for_subset(
+            subset,
+            beta,
+            n_bootstrap,
+            seed + int(row_index)
+        )
+
+        record = row.to_dict()
+        record.update(stats)
+
+        enriched_records.append(record)
+
+    enriched = pd.DataFrame.from_records(enriched_records)
+
+    out_path = output_dir / "jarzynski_summary_with_bootstrap.csv"
+
+    enriched.to_csv(out_path, index=False)
+
+    return enriched
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--output", type=str, default="outputs")
+    parser.add_argument("--bootstrap", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--dpi", type=int, default=180)
+
+    args = parser.parse_args()
+
+    output_dir = Path(args.output)
+
+    add_bootstrap_to_jarzynski_summary(
         output_dir,
-        corr_hidden_gap,
-        corr_mutual_information
+        args.bootstrap,
+        args.seed
     )
 
     print("Done.")
-    print("Input files are in:", input_dir)
-    print("Output files are in:", output_dir)
+    print(output_dir)
 
-    print(
-        "Correlation boundary EP versus hidden gap:",
-        corr_hidden_gap
+
+if __name__ == "__main__":
+    main()
+'''
+
+# 5. 저장
+file_path.write_text(code, encoding="utf-8")
+
+print("Created:", file_path)
+
+from pathlib import Path
+
+project_dir = Path("/kaggle/working/renyi_work_project")
+
+print("project exists:", project_dir.exists())
+
+if project_dir.exists():
+    for p in project_dir.iterdir():
+        print(p)
+
+%%writefile /kaggle/working/renyi_work_project/postprocess_additional_analyses.py
+import argparse
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def bootstrap_jarzynski_delta_F_for_subset(
+    work_values,
+    beta,
+    n_bootstrap,
+    seed
+):
+    rng = np.random.default_rng(seed)
+
+    estimates = list()
+    sample_size = work_values.size
+
+    for repeat in range(n_bootstrap):
+        sample = rng.choice(
+            work_values,
+            size=sample_size,
+            replace=True
+        )
+
+        exp_average = float(
+            np.mean(np.exp(-beta * sample))
+        )
+
+        estimate = -math.log(exp_average) / beta
+        estimates.append(estimate)
+
+    estimates = np.array(estimates, dtype=float)
+
+    low, median, high = np.quantile(
+        estimates,
+        (0.025, 0.5, 0.975)
     )
 
-    print(
-        "Correlation boundary EP versus mutual information:",
-        corr_mutual_information
-    )
+    return {
+        "jarzynski_bootstrap_low": float(low),
+        "jarzynski_bootstrap_median": float(median),
+        "jarzynski_bootstrap_high": float(high),
+        "jarzynski_bootstrap_width": float(high - low)
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--output", type=str, default="outputs")
+    parser.add_argument("--bootstrap", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--dpi", type=int, default=180)
+
+    args = parser.parse_args()
+
+    output_dir = Path(args.output)
+
+    print("Output dir:", output_dir)
 
 
 if __name__ == "__main__":
     main()
 
+from pathlib import Path
+
+path = Path("/kaggle/working/renyi_work_project/postprocess_additional_analyses.py")
+
+print("postprocess file exists:", path.exists())
+%cd /kaggle/working/renyi_work_project
+!ls -la
+!python run_renyi_work_project.py --config config.yaml
+!python postprocess_additional_analyses.py --output outputs --bootstrap 1000 --seed 123 --dpi 180
+
+from pathlib import Path
+
+file_path = Path("/kaggle/working/renyi_work_project/postprocess_additional_analyses.py")
+file_path.parent.mkdir(parents=True, exist_ok=True)
+
+code = r'''
+import argparse
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def bootstrap_jarzynski_delta_F_for_subset(
+    work_values,
+    beta,
+    n_bootstrap,
+    seed
+):
+    rng = np.random.default_rng(seed)
+
+    estimates = list()
+    sample_size = work_values.size
+
+    for _ in range(n_bootstrap):
+        sample = rng.choice(
+            work_values,
+            size=sample_size,
+            replace=True
+        )
+
+        exp_average = float(np.mean(np.exp(-beta * sample)))
+        estimate = -math.log(exp_average) / beta
+        estimates.append(estimate)
+
+    estimates = np.array(estimates, dtype=float)
+
+    low, median, high = np.quantile(
+        estimates,
+        (0.025, 0.5, 0.975)
+    )
+
+    return {
+        "jarzynski_bootstrap_low": float(low),
+        "jarzynski_bootstrap_median": float(median),
+        "jarzynski_bootstrap_high": float(high),
+        "jarzynski_bootstrap_width": float(high - low)
+    }
+
+
+def add_bootstrap_to_jarzynski_summary(output_dir, n_bootstrap, seed):
+    output_dir = Path(output_dir)
+
+    raw_path = output_dir / "work_trajectories.csv"
+    summary_path = output_dir / "jarzynski_summary.csv"
+
+    raw = pd.read_csv(raw_path)
+    summary = pd.read_csv(summary_path)
+
+    work_all = raw.work.to_numpy(dtype=float)
+
+    enriched_records = []
+
+    for i, row in summary.iterrows():
+        ntraj = int(row.n_trajectories)
+        beta = float(row.beta)
+
+        subset = work_all[:ntraj]
+
+        stats = bootstrap_jarzynski_delta_F_for_subset(
+            subset,
+            beta,
+            n_bootstrap,
+            seed + i
+        )
+
+        record = row.to_dict()
+        record.update(stats)
+        enriched_records.append(record)
+
+    enriched = pd.DataFrame.from_records(enriched_records)
+
+    out_path = output_dir / "jarzynski_summary_with_bootstrap.csv"
+    enriched.to_csv(out_path, index=False)
+
+    return enriched
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=str, default="outputs")
+    parser.add_argument("--bootstrap", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--dpi", type=int, default=180)
+
+    args = parser.parse_args()
+
+    output_dir = Path(args.output)
+
+    add_bootstrap_to_jarzynski_summary(
+        output_dir,
+        args.bootstrap,
+        args.seed
+    )
+
+    print("Done:", output_dir)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+file_path.write_text(code, encoding="utf-8")
+
+print("Created:", file_path)
+
+!python /kaggle/working/renyi_work_project/postprocess_additional_analyses.py \
+  --output /kaggle/working/renyi_work_project/outputs \
+  --bootstrap 1000 \
+  --seed 123 \
+  --dpi 180
+
+# =========================
+# FILE CREATION (KAGGLE SAFE)
+# =========================
+
+from pathlib import Path
+
+project_dir = Path("/kaggle/working/renyi_work_project")
+project_dir.mkdir(parents=True, exist_ok=True)
+
+file_path = project_dir / "patch_site_set_partial_trace.py"
+
+
+# =========================================================
+# patch_site_set_partial_trace.py
+# =========================================================
+
+from pathlib import Path
+import argparse
+import shutil
+import subprocess
+import sys
+
+
+# =========================================================
+# find project file
+# =========================================================
+def find_project_file():
+    cwd = Path.cwd()
+
+    candidate_1 = cwd / "run_renyi_work_project.py"
+    candidate_2 = cwd / "renyi_work_project" / "run_renyi_work_project.py"
+
+    if candidate_1.exists():
+        return candidate_1
+
+    if candidate_2.exists():
+        return candidate_2
+
+    raise FileNotFoundError(
+        "Could not find run_renyi_work_project.py. "
+        "Run this script either inside renyi_work_project "
+        "or in the parent directory containing renyi_work_project."
+    )
+
+
+# =========================================================
+# site-set functions to inject
+# =========================================================
+SITE_SET_FUNCTIONS = r'''
+def reduced_density_matrix_from_site_set_pure_state(
+    psi,
+    L,
+    A_sites
+):
+    A_sites = tuple(int(site) for site in A_sites)
+    A_set = set(A_sites)
+
+    B_sites = tuple(
+        site for site in range(L)
+        if site not in A_set
+    )
+
+    A_axes = tuple(L - 1 - site for site in A_sites)
+    B_axes = tuple(L - 1 - site for site in B_sites)
+
+    permutation = A_axes + B_axes
+
+    dims = tuple(2 for _ in range(L))
+
+    psi_tensor = np.reshape(psi, dims, order="C")
+    psi_permuted = np.transpose(psi_tensor, axes=permutation)
+
+    dimA = 2 ** len(A_sites)
+    dimB = 2 ** len(B_sites)
+
+    psi_matrix = np.reshape(psi_permuted, (dimA, dimB), order="C")
+
+    rhoA = psi_matrix @ np.conjugate(psi_matrix).T
+    return rhoA
+
+
+def renyi2_entropy_site_set(psi, L, A_sites):
+    rhoA = reduced_density_matrix_from_site_set_pure_state(psi, L, A_sites)
+    purity = float(np.real(np.trace(rhoA @ rhoA)))
+
+    if purity <= 0.0:
+        return float("nan"), purity
+
+    S2 = -math.log(purity)
+    return float(S2), float(purity)
+
+
+def von_neumann_entropy_site_set(psi, L, A_sites):
+    rhoA = reduced_density_matrix_from_site_set_pure_state(psi, L, A_sites)
+
+    evals = np.linalg.eigvalsh(rhoA)
+    evals = np.real(evals)
+    evals = np.maximum(evals, 0.0)
+
+    entropy = 0.0
+    for value in evals:
+        if value > 1e-14:
+            entropy -= float(value) * math.log(float(value))
+
+    return float(entropy)
+'''
+
+
+# =========================================================
+# patterns to replace
+# =========================================================
+OLD_ENTROPY_BLOCK = '''
+            S2, purity = (
+                renyi2_entropy_contiguous_subsystem(
+                    psi0, L, LA
+                )
+            )
+
+            SvN = (
+                von_neumann_entropy_contiguous_subsystem(
+                    psi0, L, LA
+                )
+            )
+'''
+
+NEW_ENTROPY_BLOCK = '''
+            S2, purity = renyi2_entropy_site_set(
+                psi0,
+                L,
+                A_sites
+            )
+
+            SvN = von_neumann_entropy_site_set(
+                psi0,
+                L,
+                A_sites
+            )
+'''
+
+OLD_LA_BLOCK = '''
+        if LA >= L:
+            LA = L // 2
+
+        for h in h_values:
+'''
+
+NEW_LA_BLOCK = '''
+        if LA >= L:
+            LA = L // 2
+
+        A_sites = tuple(range(LA))
+
+        for h in h_values:
+'''
+
+
+# =========================================================
+# patch logic
+# =========================================================
+def patch_code(code):
+    changed = False
+
+    # insert functions
+    if "reduced_density_matrix_from_site_set_pure_state" not in code:
+        marker = "\ndef compute_entanglement_scan(cfg):"
+        code = code.replace(marker, SITE_SET_FUNCTIONS + marker, 1)
+        changed = True
+
+    # add A_sites
+    if OLD_LA_BLOCK in code:
+        code = code.replace(OLD_LA_BLOCK, NEW_LA_BLOCK, 1)
+        changed = True
+
+    # replace entropy block
+    if OLD_ENTROPY_BLOCK in code:
+        code = code.replace(OLD_ENTROPY_BLOCK, NEW_ENTROPY_BLOCK, 1)
+        changed = True
+
+    return code, changed
+
+
+# =========================================================
+# main (Kaggle-safe)
+# =========================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", action="store_true")
+    parser.add_argument("--config", type=str, default="config.yaml")
+
+    # IMPORTANT: Kaggle/Jupyter safe parsing
+    args, unknown = parser.parse_known_args()
+
+    target_file = find_project_file()
+    project_dir = target_file.parent
+
+    print("Target file:", target_file)
+
+    code = target_file.read_text(encoding="utf-8")
+    patched_code, changed = patch_code(code)
+
+    if changed:
+        backup_file = target_file.with_suffix(
+            target_file.suffix + ".bak_partial_trace"
+        )
+        shutil.copy2(target_file, backup_file)
+
+        target_file.write_text(patched_code, encoding="utf-8")
+        print("Patch applied. Backup created:", backup_file)
+    else:
+        print("No changes needed.")
+
+    if args.run:
+        print("Running project...")
+        subprocess.run(
+            [sys.executable, str(target_file.name), "--config", args.config],
+            cwd=str(project_dir)
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+from pathlib import Path
+
+project_dir = Path("/kaggle/working/renyi_work_project")
+project_dir.mkdir(parents=True, exist_ok=True)
+
+file_path = project_dir / "patch_site_set_partial_trace.py"
+
+code = r"""
+# (여기에 patch 코드 전체 넣기)
+# =========================================================
+# patch_site_set_partial_trace.py
+# =========================================================
+
+from pathlib import Path
+import argparse
+import shutil
+import subprocess
+import sys
+
+
+# =========================================================
+# find project file
+# =========================================================
+def find_project_file():
+    cwd = Path.cwd()
+
+    candidate_1 = cwd / "run_renyi_work_project.py"
+    candidate_2 = cwd / "renyi_work_project" / "run_renyi_work_project.py"
+
+    if candidate_1.exists():
+        return candidate_1
+
+    if candidate_2.exists():
+        return candidate_2
+
+    raise FileNotFoundError(
+        "Could not find run_renyi_work_project.py. "
+        "Run this script either inside renyi_work_project "
+        "or in the parent directory containing renyi_work_project."
+    )
+
+
+# =========================================================
+# site-set functions to inject
+# =========================================================
+SITE_SET_FUNCTIONS = r'''
+def reduced_density_matrix_from_site_set_pure_state(
+    psi,
+    L,
+    A_sites
+):
+    A_sites = tuple(int(site) for site in A_sites)
+    A_set = set(A_sites)
+
+    B_sites = tuple(
+        site for site in range(L)
+        if site not in A_set
+    )
+
+    A_axes = tuple(L - 1 - site for site in A_sites)
+    B_axes = tuple(L - 1 - site for site in B_sites)
+
+    permutation = A_axes + B_axes
+
+    dims = tuple(2 for _ in range(L))
+
+    psi_tensor = np.reshape(psi, dims, order="C")
+    psi_permuted = np.transpose(psi_tensor, axes=permutation)
+
+    dimA = 2 ** len(A_sites)
+    dimB = 2 ** len(B_sites)
+
+    psi_matrix = np.reshape(psi_permuted, (dimA, dimB), order="C")
+
+    rhoA = psi_matrix @ np.conjugate(psi_matrix).T
+    return rhoA
+
+
+def renyi2_entropy_site_set(psi, L, A_sites):
+    rhoA = reduced_density_matrix_from_site_set_pure_state(psi, L, A_sites)
+    purity = float(np.real(np.trace(rhoA @ rhoA)))
+
+    if purity <= 0.0:
+        return float("nan"), purity
+
+    S2 = -math.log(purity)
+    return float(S2), float(purity)
+
+
+def von_neumann_entropy_site_set(psi, L, A_sites):
+    rhoA = reduced_density_matrix_from_site_set_pure_state(psi, L, A_sites)
+
+    evals = np.linalg.eigvalsh(rhoA)
+    evals = np.real(evals)
+    evals = np.maximum(evals, 0.0)
+
+    entropy = 0.0
+    for value in evals:
+        if value > 1e-14:
+            entropy -= float(value) * math.log(float(value))
+
+    return float(entropy)
+'''
+
+
+# =========================================================
+# patterns to replace
+# =========================================================
+OLD_ENTROPY_BLOCK = '''
+            S2, purity = (
+                renyi2_entropy_contiguous_subsystem(
+                    psi0, L, LA
+                )
+            )
+
+            SvN = (
+                von_neumann_entropy_contiguous_subsystem(
+                    psi0, L, LA
+                )
+            )
+'''
+
+NEW_ENTROPY_BLOCK = '''
+            S2, purity = renyi2_entropy_site_set(
+                psi0,
+                L,
+                A_sites
+            )
+
+            SvN = von_neumann_entropy_site_set(
+                psi0,
+                L,
+                A_sites
+            )
+'''
+
+OLD_LA_BLOCK = '''
+        if LA >= L:
+            LA = L // 2
+
+        for h in h_values:
+'''
+
+NEW_LA_BLOCK = '''
+        if LA >= L:
+            LA = L // 2
+
+        A_sites = tuple(range(LA))
+
+        for h in h_values:
+'''
+
+
+# =========================================================
+# patch logic
+# =========================================================
+def patch_code(code):
+    changed = False
+
+    # insert functions
+    if "reduced_density_matrix_from_site_set_pure_state" not in code:
+        marker = "\ndef compute_entanglement_scan(cfg):"
+        code = code.replace(marker, SITE_SET_FUNCTIONS + marker, 1)
+        changed = True
+
+    # add A_sites
+    if OLD_LA_BLOCK in code:
+        code = code.replace(OLD_LA_BLOCK, NEW_LA_BLOCK, 1)
+        changed = True
+
+    # replace entropy block
+    if OLD_ENTROPY_BLOCK in code:
+        code = code.replace(OLD_ENTROPY_BLOCK, NEW_ENTROPY_BLOCK, 1)
+        changed = True
+
+    return code, changed
+
+
+# =========================================================
+# main
+# =========================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", action="store_true")
+    parser.add_argument("--config", type=str, default="config.yaml")
+
+    # IMPORTANT: Kaggle/Jupyter safe parsing
+    args, unknown = parser.parse_known_args()
+
+    target_file = find_project_file()
+    project_dir = target_file.parent
+
+    print("Target file:", target_file)
+
+    code = target_file.read_text(encoding="utf-8")
+    patched_code, changed = patch_code(code)
+
+    if changed:
+        backup_file = target_file.with_suffix(
+            target_file.suffix + ".bak_partial_trace"
+        )
+        shutil.copy2(target_file, backup_file)
+
+        target_file.write_text(patched_code, encoding="utf-8")
+        print("Patch applied. Backup created:", backup_file)
+    else:
+        print("No changes needed.")
+
+    if args.run:
+        print("Running project...")
+        subprocess.run(
+            [sys.executable, str(target_file.name), "--config", args.config],
+            cwd=str(project_dir)
+        )
+
+
+if __name__ == "__main__":
+    main()
+print("hello patch file")
+"""
+
+file_path.write_text(code, encoding="utf-8")
+
+print("CREATED:", file_path)
+
+!ls -la /kaggle/working/renyi_work_project
+
+%cd /kaggle/working/renyi_work_project
+
+!python patch_site_set_partial_trace.py --run
+!python run_renyi_work_project.py --config config.yaml
+
+!find /kaggle/working -name "postprocess_additional_analyses.py"
+
+%cd /kaggle/working/renyi_work_project
+
+!grep -n "renyi2_entropy_site_set" run_renyi_work_project.py
+%cd /kaggle/working/renyi_work_project
+!grep -n "def renyi2_entropy_site_set" run_renyi_work_project.py \\ echo "DEF NOT FOUND"
+
+from pathlib import Path
+
+base = Path("/kaggle/working")
+
+for p in base.rglob("run_renyi_work_project.py"):
+    print("FOUND:", p)
+%cd /kaggle/working/renyi_work_project
+!python run_renyi_work_project.py --config config.yaml
+!python patch_site_set_partial_trace.py --run
+
+from pathlib import Path
 import shutil
 
-shutil.make_archive(
-    "toy_outputs",
-    "zip",
-    "toy_outputs"
+# =========================================================
+# 1. 프로젝트 경로 탐지
+# =========================================================
+base = Path("/kaggle/working")
+
+candidates = [
+    base / "renyi_work_project",
+    base / "reny_work_project",
+]
+
+project_dir = None
+for c in candidates:
+    if (c / "run_renyi_work_project.py").exists():
+        project_dir = c
+        break
+
+if project_dir is None:
+    raise FileNotFoundError("run_renyi_work_project.py not found in working directory")
+
+path = project_dir / "run_renyi_work_project.py"
+print("FOUND:", path)
+
+
+# =========================================================
+# 2. 파일 읽기
+# =========================================================
+code = path.read_text(encoding="utf-8")
+
+code = code.replace(
+    "reni2_entropy_site_set",
+    "renyi2_entropy_site_set"
 )
 
-print("ZIP file created: toy_outputs.zip")
 
-import zipfile
+# =========================================================
+# 4. 함수 정의 삽입 코드
+# =========================================================
+site_set_functions = r'''
 
-with zipfile.ZipFile("toy_outputs.zip", "r") as z:
-    bad_file = z.testzip()
+def reduced_density_matrix_from_site_set_pure_state(
+    psi,
+    L,
+    A_sites
+):
+    A_sites = tuple(int(site) for site in A_sites)
+    A_set = set(A_sites)
 
-if bad_file is None:
-    print("ZIP integrity check passed.")
+    B_sites = tuple(
+        site for site in range(L)
+        if site not in A_set
+    )
+
+    A_axes = tuple(L - 1 - site for site in A_sites)
+    B_axes = tuple(L - 1 - site for site in B_sites)
+
+    permutation = A_axes + B_axes
+
+    dims = tuple(2 for _ in range(L))
+
+    psi_tensor = np.reshape(psi, dims, order="C")
+    psi_permuted = np.transpose(psi_tensor, axes=permutation)
+
+    dimA = 2 ** len(A_sites)
+    dimB = 2 ** len(B_sites)
+
+    psi_matrix = np.reshape(psi_permuted, (dimA, dimB), order="C")
+
+    rhoA = psi_matrix @ np.conjugate(psi_matrix).T
+    return rhoA
+
+
+def renyi2_entropy_site_set(psi, L, A_sites):
+    rhoA = reduced_density_matrix_from_site_set_pure_state(psi, L, A_sites)
+    purity = float(np.real(np.trace(rhoA @ rhoA)))
+
+    if purity <= 0.0:
+        return float("nan"), purity
+
+    S2 = -math.log(purity)
+    return float(S2), float(purity)
+
+
+def von_neumann_entropy_site_set(psi, L, A_sites):
+    rhoA = reduced_density_matrix_from_site_set_pure_state(psi, L, A_sites)
+
+    evals = np.linalg.eigvalsh(rhoA)
+    evals = np.real(evals)
+    evals = np.maximum(evals, 0.0)
+
+    entropy = 0.0
+    for value in evals:
+        if value > 1e-14:
+            entropy -= float(value) * math.log(float(value))
+
+    return float(entropy)
+'''
+
+marker_candidates = [
+    "\ndef compute_entanglement_scan",
+    "def compute_entanglement_scan",
+]
+
+marker = None
+for m in marker_candidates:
+    if m in code:
+        marker = m
+        break
+
+if marker is None:
+    raise RuntimeError("compute_entanglement_scan not found")
+
+if "renyi2_entropy_site_set" in code:
+    print("Already patched. Skipping insertion.")
 else:
-    print("Corrupted file:", bad_file)
+    backup_path = path.with_suffix(".py.bak_before_site_set")
+
+    shutil.copy2(path, backup_path)
+
+    code = code.replace(marker, site_set_functions + marker, 1)
+
+    path.write_text(code, encoding="utf-8")
+
+    print("Inserted site-set entropy functions.")
+    print("Backup created:", backup_path)
+%cd /kaggle/working/renyi_work_project
+
+!grep -n "renyi2_entropy_site_set" run_renyi_work_project.py || echo "NOT FOUND"
+%cd /kaggle/working/renyi_work_project
+
+!grep -n "A_sites" run_renyi_work_project.py || echo "A_sites NOT FOUND"
+!ls -1b /kaggle/working/renyi_work_project
+%cd /kaggle/working/renyi_work_project
+
+!grep -n "import math" run_renyi_work_project.py || echo "math NOT FOUND"
+!grep -n "import numpy as np" run_renyi_work_project.py || echo "numpy NOT FOUND"
+%cd /kaggle/working/renyi_work_project
+!python run_renyi_work_project.py --config config.yaml
+%cd /kaggle/working/renyi_work_project
+!python3 patch_site_set_partial_trace.py --run
+!python postprocess_additional_analyses.py --output outputs --bootstrap 1000 --seed 123 --dpi 180
+!zip -r renyi_full_results.zip renyi_work_project outputs
